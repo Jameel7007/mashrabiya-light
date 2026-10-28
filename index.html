@@ -58,6 +58,27 @@ body { margin: 0; overflow: hidden; background: var(--bg); color: var(--ink); fo
 }
 #tilt:focus-visible { outline: 2px solid var(--glow); outline-offset: 3px; }
 
+/* the small toolbar: lattice patterns and sound, top centre so reaching for it on desktop lands near noon */
+.tools {
+  position: fixed; top: calc(max(12px, env(safe-area-inset-top, 0px)) + 4px); left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 2px; padding: 4px; z-index: 3;
+  background: var(--chip); border: 1px solid var(--chip-line); border-radius: 999px;
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  opacity: .8; transition: opacity .4s ease;
+}
+.tools:hover, .tools:focus-within { opacity: 1; }
+.tools .sep { width: 1px; height: 22px; margin: 0 4px; background: var(--chip-line); }
+.tool {
+  width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%; display: grid; place-items: center;
+  background: transparent; color: var(--ink); cursor: pointer; transition: background-color .25s ease, color .25s ease;
+}
+.tool svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.tool:hover { background: rgba(251, 241, 226, .1); }
+.tool:focus-visible { outline: 2px solid var(--glow); outline-offset: 1px; }
+#sound .wave { display: none; }
+#sound[aria-pressed="true"] .wave { display: inline; }
+#sound[aria-pressed="true"] .mute { display: none; }
+
 #veil {
   position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); color: var(--veil-ink);
   transition: opacity 1.8s ease; z-index: 5;
@@ -79,6 +100,16 @@ body { margin: 0; overflow: hidden; background: var(--bg); color: var(--ink); fo
     <p class="hint" id="hint">Move across the room to move the sun</p>
   </div>
   <button id="tilt" type="button" hidden>Use tilt</button>
+</div>
+
+<div class="tools" id="tools">
+  <button id="sound" class="tool" type="button" aria-pressed="false" aria-label="Sound off">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 9.5h3.2L11.5 6v12l-4.3-3.5H4z"/>
+      <path class="wave" d="M14.6 9.3a3.8 3.8 0 0 1 0 5.4M17 6.9a7.2 7.2 0 0 1 0 10.2"/>
+      <path class="mute" d="M15.2 9.6l4.8 4.8M20 9.6l-4.8 4.8"/>
+    </svg>
+  </button>
 </div>
 
 <div id="veil"><div class="mark"><span class="ar" lang="ar">مشربية</span><p id="veilText">Opening the shutters</p></div></div>
@@ -1058,6 +1089,218 @@ if (isTouch && window.DeviceOrientationEvent) {
   }
 }
 
+/* ---------- Sound: a courtyard fountain, distant birds by day, crickets after dusk ---------- */
+// All of it is made with the Web Audio API, so nothing is downloaded. It stays silent until the
+// first tap or click anywhere, and turning it off is remembered.
+const sound = (() => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const btn = document.getElementById("sound");
+  if (!AC) { btn.hidden = true; return { update() {} }; }
+  const R = Math.random, SR = 44100;
+  let ctx = null, master = null, birds = null, crickets = null, loops = null;
+  let wanted = true, armed = false, day = 0.5, nextBird = 0, crickLevel = -1;
+  try { wanted = localStorage.getItem("mashrabiya-sound") !== "off"; } catch (e) {}
+
+  // The two loops are rendered sample by sample into plain arrays, in a background worker so the
+  // picture never stutters (or right here if workers are unavailable). This function runs alone in
+  // the worker, so it must not reach outside itself.
+  function synth() {
+    const R = Math.random, SR = 44100;
+    function render(sec, fill) {
+      const n = Math.round(SR * sec), L = new Float32Array(n), Rt = new Float32Array(n);
+      fill(L, Rt, n);
+      return [L, Rt];
+    }
+    // a small fountain: a soft wash of falling water that surges a little, and a steady patter of
+    // tiny rising bubbles, which is what makes water sound like water
+    function fountain(L, Rt, n) {
+      // The wash is filtered noise. The same noise is run through the filters twice and only the second
+      // lap is kept, so the end flows straight back into the start; its surges repeat a whole number of
+      // times per loop for the same reason.
+      const wl = new Float32Array(n), wr = new Float32Array(n);
+      for (let i = 0; i < n; i++) { wl[i] = R() * 2 - 1; wr[i] = R() * 2 - 1; }
+      const surge = [3, 5, 8, 13].map(k => [k, R() * 6.283, 0.05 + 0.05 * R()]);
+      let a = 0, b = 0, c = 0, d = 0;
+      for (let i = 0; i < 2 * n; i++) {
+        const j = i % n;
+        a += (wl[j] - a) * 0.3; b += (a - b) * 0.05;
+        c += (wr[j] - c) * 0.3; d += (c - d) * 0.05;
+        if (i < n) continue;
+        let m = 0.55;
+        for (const [k, ph, amp] of surge) m += amp * Math.sin(6.283 * k * j / n + ph);
+        L[j] = (a - b) * 0.035 * m; Rt[j] = (c - d) * 0.035 * m;
+      }
+      for (let k = 0, count = Math.round(n / SR * 220); k < count; k++) {
+        const f0 = 380 * Math.pow(2, R() * 2.4), dur = 0.012 + 0.04 * R() * 700 / f0;
+        const amp = 0.09 * R() * R() * (0.5 + 400 / f0), pan = R();
+        const s0 = Math.floor(R() * n), len = Math.round(dur * SR);
+        let ph = 0;
+        for (let i = 0; i < len; i++) {
+          const t = i / SR;
+          ph += 2 * Math.PI * f0 * (1 + 1.6 * t / dur) / SR;
+          const v = Math.sin(ph) * Math.min(1, t / 0.0015) * Math.exp(-t / (dur * 0.35)) * amp;
+          const j = (s0 + i) % n;   // bubbles that run past the end wrap round, so the loop has no seam
+          L[j] += v * (1.1 - 0.8 * pan); Rt[j] += v * (0.3 + 0.8 * pan);
+        }
+      }
+    }
+    // crickets: three of them, short pulse trains near 4.5 kHz, out of step with each other
+    function cricketSong(L, Rt, n) {
+      [0.2, 0.8, 0.5].forEach((pan, c) => {
+        const f = 4200 + 260 * c + 120 * R(), period = 0.55 + 0.5 * R();
+        for (let t0 = R() * period; t0 < n / SR - 0.15; t0 += period * (0.9 + 0.2 * R())) {
+          for (let p = 0; p < 3; p++) {
+            const s0 = Math.round((t0 + p * 0.032) * SR), len = Math.round(0.018 * SR);
+            for (let i = 0; i < len; i++) {
+              const v = Math.sin(2 * Math.PI * f * i / SR) * Math.sin(Math.PI * i / len) * 0.05;
+              L[s0 + i] += v * (1 - pan); Rt[s0 + i] += v * pan;
+            }
+          }
+        }
+      });
+    }
+    return { fountain: render(8, fountain), crickets: render(7, cricketSong) };
+  }
+  let preparing = false, outside = null, basin = null;
+  function prepare() {
+    if (preparing) return;
+    preparing = true;
+    const here = () => { loops = synth(); startLoops(); };
+    try {
+      const url = URL.createObjectURL(new Blob([`const d = (${synth})();
+postMessage(d, [d.fountain[0].buffer, d.fountain[1].buffer, d.crickets[0].buffer, d.crickets[1].buffer]);`], { type: "text/javascript" }));
+      const w = new Worker(url);
+      w.onmessage = e => { loops = e.data; w.terminate(); URL.revokeObjectURL(url); startLoops(); };
+      w.onerror = () => { w.terminate(); here(); };
+    } catch (e) { here(); }
+  }
+  (window.requestIdleCallback || (f => setTimeout(f, 1500)))(prepare, { timeout: 5000 });
+  function startLoops() {
+    if (!ctx || !loops || crickets) return;
+    play(loops.fountain, 0.9, basin);
+    crickets = play(loops.crickets, 0, outside);
+  }
+
+  function play([L, Rt], gain, dest) {
+    const buf = ctx.createBuffer(2, L.length, SR);
+    buf.getChannelData(0).set(L); buf.getChannelData(1).set(Rt);
+    const src = ctx.createBufferSource(), g = ctx.createGain();
+    src.buffer = buf; src.loop = true; g.gain.value = gain;
+    src.connect(g).connect(dest); src.start();
+    return g;
+  }
+  function build() {
+    ctx = new AC();
+    ctx.resume();
+    try { if (navigator.audioSession) navigator.audioSession.type = "ambient"; } catch (e) {}   // mix with other audio on iOS
+    master = ctx.createGain(); master.gain.value = 0; master.connect(ctx.destination);
+    // a courtyard's echo: a short burst of decaying noise used as the room's impulse response
+    const verb = ctx.createConvolver(), n = Math.round(ctx.sampleRate * 2.4), ir = ctx.createBuffer(2, n, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) { const d = ir.getChannelData(ch); for (let i = 0; i < n; i++) d[i] = (R() * 2 - 1) * Math.pow(1 - i / n, 3); }
+    verb.buffer = ir;
+    const wet = ctx.createGain(); wet.gain.value = 0.3;
+    verb.connect(wet).connect(master);
+    // everything is outside, heard through the screen: a little dulled, with the echo behind it
+    outside = ctx.createBiquadFilter(); outside.type = "lowpass"; outside.frequency.value = 5200;
+    outside.connect(master); outside.connect(verb);
+    basin = ctx.createBiquadFilter(); basin.type = "highpass"; basin.frequency.value = 250;   // no rumble
+    basin.connect(outside);
+    birds = ctx.createGain(); birds.gain.value = 0.5; birds.connect(outside);
+    prepare();
+    startLoops();
+    nextBird = ctx.currentTime + 1.2;
+  }
+  // a bird's whistle swept between two pitches, with an optional warble
+  function whistle(out, t, f1, f2, dur, warble) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    if (warble) {
+      const l = ctx.createOscillator(), lg = ctx.createGain();
+      l.frequency.value = warble; lg.gain.value = f1 * 0.05;
+      l.connect(lg).connect(o.frequency); l.start(t); l.stop(t + dur + 0.05);
+    }
+    g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(1, t + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g).connect(out); o.start(t); o.stop(t + dur + 0.05);
+  }
+  function call(t) {
+    const out = ctx.createGain();
+    out.gain.value = 0.35 + 0.65 * R();
+    if (ctx.createStereoPanner) { const p = ctx.createStereoPanner(); p.pan.value = 1.6 * R() - 0.8; out.connect(p).connect(birds); }
+    else out.connect(birds);
+    const kind = R(), noon = 1 - Math.min(1, Math.abs(day - 0.5) * 2);
+    if (kind < 0.15 + 0.3 * noon) {
+      // a laughing dove's soft, hollow coo, more often in the heat of the day
+      for (const [f, d, at] of [[520, 0.15, 0], [560, 0.15, 0.21], [610, 0.26, 0.42], [550, 0.17, 0.75], [505, 0.22, 0.98]]) {
+        const o = ctx.createOscillator(), lp = ctx.createBiquadFilter(), g = ctx.createGain();
+        o.type = "triangle"; lp.type = "lowpass"; lp.frequency.value = 900;
+        o.frequency.setValueAtTime(f * 0.95, t + at); o.frequency.linearRampToValueAtTime(f, t + at + d * 0.4); o.frequency.linearRampToValueAtTime(f * 0.93, t + at + d);
+        g.gain.setValueAtTime(0, t + at); g.gain.linearRampToValueAtTime(0.9, t + at + d * 0.35); g.gain.linearRampToValueAtTime(0, t + at + d);
+        o.connect(lp).connect(g).connect(out); o.start(t + at); o.stop(t + at + d + 0.05);
+      }
+    } else if (kind < 0.62) {
+      // a short liquid song
+      const base = 1700 + 1500 * R();
+      for (let i = 0, at = 0, n = 3 + Math.floor(4 * R()); i < n; i++) {
+        const f = base * (0.8 + 0.45 * R()), d = 0.07 + 0.1 * R();
+        whistle(out, t + at, f, f * (0.75 + 0.6 * R()), d, 20 + 30 * R());
+        at += d + 0.04 + 0.1 * R();
+      }
+    } else {
+      // a sparrow's chirps
+      const f = 3000 + 1500 * R();
+      for (let i = 0, n = 2 + Math.floor(4 * R()); i < n; i++) whistle(out, t + i * (0.13 + 0.04 * R()), f * 1.3, f * 0.78, 0.05, 0);
+    }
+    setTimeout(() => out.disconnect(), 3000);
+  }
+  // seconds to the next call: a dawn chorus, a drowsy noon, a few at dusk, none at night
+  const gap = () => day > 1 ? 1.5 : (1.5 + 4 * R()) / (day < 0.2 ? 1 : day > 0.8 ? 0.55 : 0.25);
+
+  function apply() {
+    const on = wanted && armed;
+    if (on && !ctx) build();
+    if (ctx) {
+      const now = ctx.currentTime;
+      master.gain.cancelScheduledValues(now);
+      master.gain.setValueAtTime(master.gain.value, now);
+      if (on) { ctx.resume(); master.gain.linearRampToValueAtTime(0.9, now + 2.5); }
+      else { master.gain.linearRampToValueAtTime(0, now + 0.5); setTimeout(() => { if (!(wanted && armed)) ctx.suspend(); }, 700); }
+    }
+    btn.setAttribute("aria-pressed", String(on));
+    btn.setAttribute("aria-label", on ? "Sound on" : "Sound off");
+  }
+  // The first tap or click anywhere (not on the toolbar) starts it, if it was not turned off before.
+  function arm(e) {
+    if (armed || (e.target.closest && e.target.closest(".tools"))) return;
+    armed = true;
+    apply();
+  }
+  window.addEventListener("pointerdown", e => { if (e.pointerType === "mouse") arm(e); });
+  window.addEventListener("pointerup", e => { if (e.pointerType !== "mouse") arm(e); });
+  btn.addEventListener("click", () => {
+    const on = wanted && armed;
+    armed = true; wanted = !on;
+    try { localStorage.setItem("mashrabiya-sound", wanted ? "on" : "off"); } catch (e) {}
+    apply();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!ctx) return;
+    if (document.hidden) ctx.suspend(); else if (wanted && armed) ctx.resume();
+  });
+
+  return {
+    update(t) {
+      day = t;
+      if (!ctx || ctx.state !== "running") return;
+      const now = ctx.currentTime;
+      if (now >= nextBird) { if (day < 1) call(now + 0.05); nextBird = now + gap(); }
+      const level = 0.9 * smooth(0.985, 1.035, day);   // crickets come out with the blue hour
+      if (crickets && Math.abs(level - crickLevel) > 0.01) { crickets.gain.setTargetAtTime(level, now, 0.8); crickLevel = level; }
+    },
+    get state() { return { ctx: ctx && ctx.state, on: wanted && armed, wanted, armed }; },
+    get nodes() { return { ctx, master, birds, crickets }; },
+  };
+})();
+
 /* ---------- Frame loop ---------- */
 let last = performance.now(), time = 0, frame = 0, fade = 0, lifted = false;
 let perfAcc = 0, perfN = 0, perfChecks = 0;
@@ -1079,6 +1322,7 @@ function tick(now) {
     tCur += (tTarget - tCur) * (1 - Math.exp(-dt * 2.4));
   }
   applyDay(tCur);
+  sound.update(tCur);
 
   // camera: a still, slightly off-centre view that leans toward where the light lands
   const wide = camera.aspect >= 1.15;
@@ -1134,7 +1378,7 @@ function tick(now) {
   }
   requestAnimationFrame(tick);
 }
-window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer, get screen() { return screen; }, pane } };
+window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer, get screen() { return screen; }, pane, sound } };
 requestAnimationFrame(tick);
 })();
 </script>
