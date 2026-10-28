@@ -138,19 +138,49 @@ function starOutline(h, c, scale) {
   }
   return out;
 }
+const about = (p, c, s) => [c[0] + (p[0] - c[0]) * s, c[1] + (p[1] - c[1]) * s];
+const ring = poly => poly.map((p, i) => [p, poly[(i + 1) % poly.length]]);
+
+/* ---------- Jewel glass (qamariya), as light transmission colours (linear) ---------- */
+// Deep on purpose: the weak channels must sit near zero for the colour to survive tone mapping.
+const JEWEL = {
+  lapis:     [0.012, 0.050, 0.78],
+  emerald:   [0.006, 0.420, 0.065],
+  ruby:      [0.820, 0.008, 0.020],
+  amber:     [1.000, 0.380, 0.012],
+  turquoise: [0.006, 0.460, 0.440],
+};
+// Rosettes that carry glass, keyed "column,row". Petals alternate two colours, a heart turns the
+// solid centre star into a small glass one, a ring glazes the openings around the rosette.
+// Mirror-symmetric, and most openings stay clear so the white light still reads.
+const GLASS8 = {
+  "-1,0":  { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
+  "0,0":   { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
+  "-2,1":  { petals: ["turquoise", "lapis"] },
+  "1,1":   { petals: ["turquoise", "lapis"] },
+  "-2,-1": { petals: ["emerald", "amber"] },
+  "1,-1":  { petals: ["emerald", "amber"] },
+  "-1,2":  { heart: "ruby" },
+  "0,2":   { heart: "ruby" },
+  "-1,-2": { heart: "turquoise" },
+  "0,-2":  { heart: "turquoise" },
+};
+
 const pattern = (() => {
   const r = CELL / 2, R8 = r / Math.cos(Math.PI / 8), rs = r * Math.tan(Math.PI / 8);
   const cy = WIN.y0 + WIN.h / 2;
-  const bars = [], spokes = [], solids = [];
+  const bars = [], spokes = [], solids = [], frames = [], motifs = [];
   const inside = (p, m) => p[0] > WIN.x0 - m && p[0] < WIN.x0 + WIN.w + m && p[1] > WIN.y0 - m && p[1] < WIN.y0 + WIN.h + m;
   for (let i = -2; i <= 1; i++) for (let k = -4; k <= 4; k++) {
     const c = [(i + 0.5) * CELL, cy + k * CELL];
     if (!inside(c, CELL * 0.6)) continue;
     const h = hankin(regular(c[0], c[1], 8, R8, Math.PI / 8));
     bars.push(...h.segs);
-    const ros = 0.36;
-    solids.push(starOutline(h, c, ros));
-    for (const m of h.mids) spokes.push([[c[0] + (m[0] - c[0]) * ros, c[1] + (m[1] - c[1]) * ros], m]);
+    const ros = 0.36, plan = GLASS8[i + "," + k] || {};
+    const heart = starOutline(h, c, ros);
+    (plan.heart ? frames : solids).push(heart);
+    for (const m of h.mids) spokes.push([about(m, c, ros), m]);
+    motifs.push({ c, r, n: 8, a0: Math.atan2(h.mids[0][1] - c[1], h.mids[0][0] - c[0]), plan });
   }
   for (let i = -2; i <= 2; i++) for (let k = -4; k <= 4; k++) {
     const c = [i * CELL, cy + (k + 0.5) * CELL];
@@ -159,39 +189,121 @@ const pattern = (() => {
     bars.push(...h.segs);
     solids.push(starOutline(h, c, 1));
   }
-  return { bars, spokes, solids };
+  return { bars, spokes, solids, frames, motifs };
 })();
 
-/* ---------- Mask texture: white = light passes, black = wood ---------- */
+// Choose the glass for one opening (by its centre) from the rosette plans around it.
+function glassFor(pat, x, y) {
+  let near = null, nd = 1e9;
+  for (const m of pat.motifs) { const d = Math.hypot(x - m.c[0], y - m.c[1]) / m.r; if (d < nd) { nd = d; near = m; } }
+  if (!near) return null;
+  if (nd < 0.2) return near.plan.heart || null;
+  if (nd < 0.8) {
+    if (!near.plan.petals) return null;
+    const step = 2 * Math.PI / near.n;
+    const q = Math.floor((Math.atan2(y - near.c[1], x - near.c[0]) - near.a0) / step);
+    return near.plan.petals[((q % 2) + 2) % 2];
+  }
+  for (const m of pat.motifs) if (m.plan.ring && Math.hypot(x - m.c[0], y - m.c[1]) / m.r < 1.3) return m.plan.ring;
+  return null;
+}
+
+/* ---------- Mask texture: rgb = colour of light let through (glass tints it), alpha = open ---------- */
 const MASK_W = 1024, MASK_H = Math.round(MASK_W * WIN.h / WIN.w);
 const PX = MASK_W / WIN.w;
-function buildMask() {
+const maskCanvas = document.createElement("canvas");
+maskCanvas.width = MASK_W; maskCanvas.height = MASK_H;
+const maskTex = new THREE.CanvasTexture(maskCanvas);
+maskTex.colorSpace = THREE.NoColorSpace;
+maskTex.premultiplyAlpha = true;            // rgb arrives multiplied by openness, so the mip blur stays right
+maskTex.generateMipmaps = true;
+maskTex.minFilter = THREE.LinearMipmapLinearFilter;
+maskTex.magFilter = THREE.LinearFilter;
+maskTex.wrapS = maskTex.wrapT = THREE.ClampToEdgeWrapping;
+
+// The wood, drawn in black at px pixels per metre (shared by the mask and the opening finder).
+// grow fattens every piece by that many pixels, which closes hairline gaps such as a spoke
+// meeting the sharp tip of a heart star.
+function drawWood(g, pat, px, grow = 0) {
+  const X = x => (x - WIN.x0) * px, Y = y => (WIN.y0 + WIN.h - y) * px;
+  const path = poly => { g.beginPath(); poly.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1]))); g.closePath(); };
+  g.strokeStyle = "#000"; g.fillStyle = "#000"; g.lineCap = "square"; g.lineJoin = "miter";
+  g.lineWidth = LAT.bar * px + grow;
+  g.beginPath();
+  for (const [a, b] of pat.bars) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
+  g.stroke();
+  g.lineWidth = LAT.bar * 0.5 * px + grow; g.lineCap = grow ? "square" : "butt";
+  g.beginPath();
+  for (const [a, b] of pat.spokes) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
+  g.stroke();
+  for (const s of pat.frames) { path(s); g.stroke(); }
+  for (const s of pat.solids) { path(s); g.fill(); if (grow) { g.lineWidth = grow; g.stroke(); } }
+  const f = 0.09 * px, w = WIN.w * px, h = WIN.h * px;   // frame
+  g.fillRect(0, 0, w, f); g.fillRect(0, h - f, w, f); g.fillRect(0, 0, f, h); g.fillRect(w - f, 0, f, h);
+}
+
+// Find every opening in the lattice (a flood fill at low resolution) and paint the glazed ones
+// into a small colour layer, grown three pixels so each pane tucks under the wood around it.
+const LBL_W = 400, LBL_H = Math.round(LBL_W * WIN.h / WIN.w);
+function glassLayer(pat) {
   const cv = document.createElement("canvas");
-  cv.width = MASK_W; cv.height = MASK_H;
-  const g = cv.getContext("2d");
-  g.fillStyle = "#fff"; g.fillRect(0, 0, MASK_W, MASK_H);
-  const X = x => (x - WIN.x0) * PX, Y = y => (WIN.y0 + WIN.h - y) * PX;
-  g.strokeStyle = "#000"; g.fillStyle = "#000"; g.lineCap = "square";
-  g.lineWidth = LAT.bar * PX;
-  g.beginPath();
-  for (const [a, b] of pattern.bars) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
-  g.stroke();
-  g.lineWidth = LAT.bar * 0.5 * PX; g.lineCap = "butt";
-  g.beginPath();
-  for (const [a, b] of pattern.spokes) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
-  g.stroke();
-  for (const s of pattern.solids) {
-    g.beginPath(); s.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1]))); g.closePath(); g.fill();
+  cv.width = LBL_W; cv.height = LBL_H;
+  const g = cv.getContext("2d", { willReadFrequently: true });
+  g.fillStyle = "#fff"; g.fillRect(0, 0, LBL_W, LBL_H);
+  drawWood(g, pat, LBL_W / WIN.w, 1.5);
+  const src = g.getImageData(0, 0, LBL_W, LBL_H).data;
+  const lab = new Int32Array(LBL_W * LBL_H).fill(-1), tints = [], stack = [];
+  const open = p => lab[p] === -1 && src[p * 4] >= 128;
+  for (let s = 0; s < lab.length; s++) {
+    if (!open(s)) continue;
+    const id = tints.length;
+    let n = 0, sx = 0, sy = 0;
+    lab[s] = id; stack.push(s);
+    while (stack.length) {
+      const p = stack.pop(), x = p % LBL_W, y = (p - x) / LBL_W;
+      n++; sx += x; sy += y;
+      if (x > 0 && open(p - 1)) { lab[p - 1] = id; stack.push(p - 1); }
+      if (x < LBL_W - 1 && open(p + 1)) { lab[p + 1] = id; stack.push(p + 1); }
+      if (y > 0 && open(p - LBL_W)) { lab[p - LBL_W] = id; stack.push(p - LBL_W); }
+      if (y < LBL_H - 1 && open(p + LBL_W)) { lab[p + LBL_W] = id; stack.push(p + LBL_W); }
+    }
+    const m = LBL_W / WIN.w, cx = WIN.x0 + (sx / n + 0.5) / m, cy = WIN.y0 + WIN.h - (sy / n + 0.5) / m;
+    const name = glassFor(pat, cx, cy);
+    // each piece is cut from a slightly different sheet
+    const shade = 0.82 + 0.28 * ((Math.sin(cx * 91.7 + cy * 47.3) * 43758.5453) % 1 + 1) % 1;
+    tints.push(name ? JEWEL[name].map(v => v * shade) : null);
   }
-  const f = 0.09 * PX;   // frame
-  g.fillRect(0, 0, MASK_W, f); g.fillRect(0, MASK_H - f, MASK_W, f); g.fillRect(0, 0, f, MASK_H); g.fillRect(MASK_W - f, 0, f, MASK_H);
-  const tex = new THREE.CanvasTexture(cv);
-  tex.colorSpace = THREE.NoColorSpace;
-  tex.generateMipmaps = true;
-  tex.minFilter = THREE.LinearMipmapLinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-  return tex;
+  const img = g.createImageData(LBL_W, LBL_H), d = img.data;
+  for (let p = 0; p < lab.length; p++) {
+    const t = lab[p] >= 0 && tints[lab[p]];
+    if (t) { d[p * 4] = t[0] * 255 + 0.5; d[p * 4 + 1] = t[1] * 255 + 0.5; d[p * 4 + 2] = t[2] * 255 + 0.5; d[p * 4 + 3] = 255; }
+  }
+  for (let pass = 0; pass < 3; pass++) {
+    const prev = new Uint8ClampedArray(d);
+    for (let p = 0; p < lab.length; p++) {
+      if (prev[p * 4 + 3] || lab[p] >= 0) continue;   // only grow into wood
+      const x = p % LBL_W;
+      for (const q of [x > 0 ? p - 1 : -1, x < LBL_W - 1 ? p + 1 : -1, p - LBL_W, p + LBL_W]) {
+        if (q < 0 || q >= lab.length || !prev[q * 4 + 3]) continue;
+        d[p * 4] = prev[q * 4]; d[p * 4 + 1] = prev[q * 4 + 1]; d[p * 4 + 2] = prev[q * 4 + 2]; d[p * 4 + 3] = 255;
+        break;
+      }
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return cv;
+}
+
+function drawMask(pat) {
+  const g = maskCanvas.getContext("2d");
+  g.globalCompositeOperation = "source-over";
+  g.fillStyle = "#fff"; g.fillRect(0, 0, MASK_W, MASK_H);
+  g.imageSmoothingEnabled = true;
+  g.drawImage(glassLayer(pat), 0, 0, MASK_W, MASK_H);
+  g.globalCompositeOperation = "destination-out";   // the wood is cut out of the alpha channel
+  drawWood(g, pat, PX);
+  g.globalCompositeOperation = "source-over";
+  maskTex.needsUpdate = true;
 }
 
 /* ---------- Renderer ---------- */
@@ -206,15 +318,16 @@ renderer.toneMapping = THREE.NoToneMapping;
 renderer.setPixelRatio(1);
 renderer.autoClear = true;
 const gl = renderer.getContext();
-const floatOK = !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
+const qs = new URLSearchParams(location.search);
+// ?ldr forces the 8-bit path that phones without float render targets take
+const floatOK = !qs.has("ldr") && !!(gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float"));
 const HDR = floatOK ? 1 : 0.25;   // 8-bit fallback: render scaled down, scale back up when compositing
 const RT_TYPE = floatOK ? THREE.HalfFloatType : THREE.UnsignedByteType;
 
 const isTouch = matchMedia("(pointer: coarse)").matches;
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
-const qs = new URLSearchParams(location.search);
 
-const maskTex = buildMask();
+drawMask(pattern);
 
 /* noise volume for drifting dust density */
 const noiseTex = (() => {
@@ -265,22 +378,25 @@ float rectVis(vec2 q, float pen) {
   vec2 b = 1.0 - smoothstep(hi - pen, hi + pen, q);
   return a.x * a.y * b.x * b.y;
 }
-float maskAt(vec3 P, float zc, float soft) {
+vec4 maskAt(vec3 P, float zc, float soft) {
   float s = (zc - P.z) / uL.z;
   vec2 q = P.xy + s * uL.xy;
   vec2 uv = (q - uWin.xy) / uWin.zw;
   float lod = log2(max(s * soft / uTexel, 1.0));
-  return textureLod(uMask, uv, lod).r;
+  return textureLod(uMask, uv, lod);
 }
-float sunVis(vec3 P, float soft) {
-  if (uL.z > -0.01 || uL.y < -0.05) return 0.0;
+// colour of the sunlight reaching P: through the wall opening, then the screen's two faces
+// (the room-side face carries the glass colour, the outer face only its openness)
+vec3 sunVis(vec3 P, float soft) {
+  if (uL.z > -0.01 || uL.y < -0.05) return vec3(0.0);
   float v = 1.0;
   if (P.z > 0.001) { float s = -P.z / uL.z; v *= rectVis(P.xy + s * uL.xy, 0.002 + s * soft); }
   { float s = (uZ.x - P.z) / uL.z; v *= rectVis(P.xy + s * uL.xy, 0.002 + s * soft); }
-  if (v <= 0.0001) return 0.0;
-  if (P.z > uZ.y) v *= maskAt(P, uZ.y, soft);
-  if (P.z > uZ.z) v *= maskAt(P, uZ.z, soft);
-  return v;
+  if (v <= 0.0001) return vec3(0.0);
+  vec3 c = vec3(v);
+  if (P.z > uZ.y) c *= maskAt(P, uZ.y, soft).rgb;
+  if (P.z > uZ.z) c *= maskAt(P, uZ.z, soft).a;
+  return c;
 }
 `;
 
@@ -354,7 +470,7 @@ const roomMat = new THREE.ShaderMaterial({
           albedo = vec3(0.66, 0.46, 0.30) * m * fine;
         }
       }
-      float vis = sunVis(P, 0.0095);
+      vec3 vis = sunVis(P, 0.0095);
       float ndl = max(dot(N, uL), 0.0);
       vec3 direct = uSunCol * ndl * vis;
       // skylight entering through the opening, treated as a small area light
@@ -369,7 +485,7 @@ const roomMat = new THREE.ShaderMaterial({
       vec3 col = albedo * (direct + sky + bounce + amb);
       vec3 H = normalize(uL + V);
       col += uSunCol * vis * specK * pow(max(dot(N, H), 0.0), specP) * ndl;
-      gl_FragColor = vec4(col * uHDR, 1.0);
+      gl_FragColor = vec4(col, 1.0);   // the light uniforms already carry the HDR scale
     }`,
 });
 
@@ -400,7 +516,9 @@ function plane(w, h, pos, rotX, rotY) {
 
 /* ---------- The carved screen ---------- */
 const woodMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB(0.13, 0.07, 0.036), roughness: 0.6, metalness: 0 });
-{
+const BOX = new THREE.BoxGeometry(1, 1, 1);
+function buildScreen(pat) {
+  const group = new THREE.Group();
   const all = [];
   const clip = (a, b) => {   // Liang-Barsky against the opening, lightly expanded
     const m = 0.03, xmin = WIN.x0 - m, xmax = WIN.x0 + WIN.w + m, ymin = WIN.y0 - m, ymax = WIN.y0 + WIN.h + m;
@@ -412,15 +530,15 @@ const woodMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB
     }
     return [[a[0] + dx * t0, a[1] + dy * t0], [a[0] + dx * t1, a[1] + dy * t1]];
   };
-  for (const s of pattern.bars) { const c = clip(s[0], s[1]); if (c) all.push([c[0], c[1], LAT.bar, true]); }
-  for (const s of pattern.spokes) all.push([s[0], s[1], LAT.bar * 0.5, false]);
+  for (const s of pat.bars) { const c = clip(s[0], s[1]); if (c) all.push([c[0], c[1], LAT.bar, true]); }
+  for (const s of pat.spokes) all.push([s[0], s[1], LAT.bar * 0.5, false]);
+  for (const poly of pat.frames) for (const [a, b] of ring(poly)) all.push([a, b, LAT.bar * 0.5, true]);
   const fw = 0.09, x1 = WIN.x0 + WIN.w, y1 = WIN.y0 + WIN.h;
   const frame = [
     [[WIN.x0, WIN.y0 + fw / 2], [x1, WIN.y0 + fw / 2]], [[WIN.x0, y1 - fw / 2], [x1, y1 - fw / 2]],
     [[WIN.x0 + fw / 2, WIN.y0], [WIN.x0 + fw / 2, y1]], [[x1 - fw / 2, WIN.y0], [x1 - fw / 2, y1]],
   ];
-  const box = new THREE.BoxGeometry(1, 1, 1);
-  const inst = new THREE.InstancedMesh(box, woodMat, all.length + 4);
+  const inst = new THREE.InstancedMesh(BOX, woodMat, all.length + 4);
   const M = new THREE.Matrix4(), Q = new THREE.Quaternion(), S = new THREE.Vector3(), T = new THREE.Vector3(), Z = new THREE.Vector3(0, 0, 1);
   let n = 0;
   for (const [a, b, w, ext] of all) {
@@ -439,12 +557,51 @@ const woodMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB
   }
   inst.count = n;
   inst.instanceMatrix.needsUpdate = true;
-  scene.add(inst);
-  const shapes = pattern.solids.map(pts => new THREE.Shape(pts.map(p => new THREE.Vector2(p[0], p[1]))));
-  const solid = new THREE.Mesh(new THREE.ExtrudeGeometry(shapes, { depth: LAT.d, bevelEnabled: false, curveSegments: 1 }), woodMat);
-  solid.position.z = LAT.zc - LAT.d / 2;
-  scene.add(solid);
+  group.add(inst);
+  if (pat.solids.length) {
+    const shapes = pat.solids.map(pts => new THREE.Shape(pts.map(p => new THREE.Vector2(p[0], p[1]))));
+    const solid = new THREE.Mesh(new THREE.ExtrudeGeometry(shapes, { depth: LAT.d, bevelEnabled: false, curveSegments: 1 }), woodMat);
+    solid.position.z = LAT.zc - LAT.d / 2;
+    group.add(solid);
+  }
+  return group;
 }
+let screen = buildScreen(pattern);
+scene.add(screen);
+
+/* ---------- Glass panes: one sheet inside the screen that shows only where the mask is tinted ---------- */
+const paneMat = new THREE.ShaderMaterial({
+  uniforms: U,
+  vertexShader: /* glsl */`
+    varying vec3 vPos;
+    void main() { vec4 wp = modelMatrix * vec4(position, 1.0); vPos = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }`,
+  fragmentShader: /* glsl */`
+    ${SUN_GLSL}
+    ${NOISE_GLSL}
+    uniform vec3 uSunCol, uZenith, uHorizon;
+    varying vec3 vPos;
+    void main() {
+      vec4 m = textureLod(uMask, (vPos.xy - uWin.xy) / uWin.zw, 0.0);
+      if (m.a < 0.35) discard;                                // wood: the carved bars sit in front
+      vec3 tint = m.rgb / m.a;
+      if (min(tint.r, min(tint.g, tint.b)) > 0.6) discard;   // a clear opening: the view shows through
+      vec3 V = normalize(vPos - cameraPosition);
+      // direct sun on the outer face, unless the wall's reveal shades this spot
+      float reach = 0.0;
+      if (uL.z < -0.01 && uL.y > -0.05) { float s = (uZ.x - vPos.z) / uL.z; reach = rectVis(vPos.xy + s * uL.xy, 0.002 + s * 0.0095); }
+      float toward = pow(max(dot(V, uL), 0.0), 5.0);         // looking toward the sun through the pane
+      vec3 sky = mix(uHorizon, uZenith, pow(clamp(V.y, 0.0, 1.0), 0.45));
+      vec3 light = uSunCol * reach * (0.25 * max(-uL.z, 0.0) + 1.5 * toward) + sky * 0.5;
+      // hand-blown glass: streaks of deeper colour and a few seed bubbles
+      float streak = fbm(vPos.xy * vec2(7.0, 19.0));
+      tint = pow(tint, vec3(0.7 + 0.6 * streak));
+      float seed = smoothstep(0.86, 0.96, vnoise(vPos.xy * 160.0));
+      gl_FragColor = vec4(tint * light * (1.0 + 0.8 * seed), 1.0);
+    }`,
+});
+const pane = new THREE.Mesh(new THREE.PlaneGeometry(WIN.w, WIN.h), paneMat);
+pane.position.set(WIN.x0 + WIN.w / 2, WIN.y0 + WIN.h / 2, LAT.zc);
+scene.add(pane);
 const sunLight = new THREE.DirectionalLight(0xffffff, 1);
 const hemi = new THREE.HemisphereLight(0xffffff, 0xffffff, 0.2);
 const bounceLight = new THREE.PointLight(0xffffff, 1, 0, 2);
@@ -467,7 +624,7 @@ const skyMat = new THREE.ShaderMaterial({
       col += uGlow * (0.5 * pow(mu, 6.0) + 2.0 * pow(mu, 60.0));
       col += uSunCol * smoothstep(0.99955, 0.9998, mu) * 30.0;
       col = mix(col, uHorizon * 0.35, smoothstep(0.0, -0.08, d.y));
-      gl_FragColor = vec4(col * 1.5 * uHDR, 1.0);
+      gl_FragColor = vec4(col * 1.5, 1.0);
     }`,
 });
 const sky = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), skyMat);
@@ -492,25 +649,25 @@ const dustMat = new THREE.ShaderMaterial({
     ${SUN_GLSL}
     attribute vec4 aSeed;
     uniform float uTime, uPx;
-    varying float vB;
+    varying vec3 vB;
     void main() {
       vec3 base = vec3(mix(-2.9, 2.9, aSeed.x), mix(0.15, 4.6, aSeed.y), mix(0.05, 6.0, aSeed.z * aSeed.z));
       float t = uTime * (0.05 + 0.08 * aSeed.w);
       vec3 p = base + vec3(sin(t * 1.3 + aSeed.x * 40.0) * 0.3, sin(t * 0.7 + aSeed.y * 30.0) * 0.22, cos(t * 1.1 + aSeed.z * 20.0) * 0.3);
-      float v = sunVis(p, 0.006);
+      vec3 v = sunVis(p, 0.006);
       float tw = 0.55 + 0.45 * sin(uTime * (0.8 + aSeed.w * 2.5) + aSeed.x * 100.0);
       vB = v * tw;
       vec4 mv = viewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mv;
-      gl_PointSize = v > 0.02 ? uPx * (0.6 + aSeed.w) / -mv.z : 0.0;
+      gl_PointSize = max(v.r, max(v.g, v.b)) > 0.02 ? uPx * (0.6 + aSeed.w) / -mv.z : 0.0;
     }`,
   fragmentShader: /* glsl */`
-    uniform vec3 uSunCol; uniform float uHDR;
-    varying float vB;
+    uniform vec3 uSunCol;
+    varying vec3 vB;
     void main() {
       float d = length(gl_PointCoord - 0.5);
       float a = smoothstep(0.5, 0.0, d);
-      gl_FragColor = vec4(uSunCol * 0.35 * vB * a * a * uHDR, 1.0);
+      gl_FragColor = vec4(uSunCol * 0.35 * vB * a * a, 1.0);
     }`,
 });
 const dust = new THREE.Points(dustGeo, dustMat);
@@ -541,7 +698,7 @@ const fogMat = new THREE.ShaderMaterial({
     precision highp sampler3D;
     ${SUN_GLSL}
     uniform sampler2D tDepth; uniform sampler3D tNoise;
-    uniform mat4 uProjInv, uViewInv; uniform vec3 uCam; uniform float uSteps, uFrame, uTime;
+    uniform mat4 uProjInv, uViewInv; uniform vec3 uCam; uniform float uSteps, uFrame, uTime, uHDR;
     varying vec2 vUv;
     void main() {
       float depth = texture(tDepth, vUv).x;
@@ -552,12 +709,12 @@ const fogMat = new THREE.ShaderMaterial({
       if (rd.z < 0.0) tMax = min(tMax, uCam.z / -rd.z);
       float dt = tMax / uSteps;
       float j = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))) + uFrame * 0.61803);
-      float acc = 0.0;
+      vec3 acc = vec3(0.0);
       for (int i = 0; i < 40; i++) {
         if (float(i) >= uSteps) break;
         vec3 X = uCam + rd * ((float(i) + j) * dt);
-        float v = sunVis(X, 0.016);
-        if (v > 0.001) {
+        vec3 v = sunVis(X, 0.016);
+        if (v.r + v.g + v.b > 0.003) {
           float n = texture(tNoise, X * vec3(0.16, 0.22, 0.16) + vec3(uTime * 0.010, uTime * 0.004, -uTime * 0.006)).r;
           float n2 = texture(tNoise, X * 0.55 + vec3(-uTime * 0.02, 0.0, uTime * 0.015)).r;
           acc += v * (0.25 + 1.5 * n * n) * (0.7 + 0.6 * n2);
@@ -566,7 +723,7 @@ const fogMat = new THREE.ShaderMaterial({
       float mu = dot(rd, uL);
       float g = 0.6;
       float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * mu, 1.5) * 0.0796;
-      gl_FragColor = vec4(acc * dt * (hg + 0.035), 0.0, 0.0, 1.0);
+      gl_FragColor = vec4(acc * dt * (hg + 0.035) * uHDR, 1.0);
     }`,
 });
 
@@ -613,10 +770,10 @@ const compMat = new THREE.ShaderMaterial({
     float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
     void main() {
       vec3 c = texture(tScene, vUv).rgb / uHDR;
-      float f = texture(tFog, vUv).r * 0.4;
-      f += (texture(tFog, vUv + uFogTexel * vec2(1.0, 0.5)).r + texture(tFog, vUv - uFogTexel * vec2(1.0, 0.5)).r
-          + texture(tFog, vUv + uFogTexel * vec2(-0.5, 1.0)).r + texture(tFog, vUv - uFogTexel * vec2(-0.5, 1.0)).r) * 0.15;
-      c += uFogCol * f;
+      vec3 f = texture(tFog, vUv).rgb * 0.4;
+      f += (texture(tFog, vUv + uFogTexel * vec2(1.0, 0.5)).rgb + texture(tFog, vUv - uFogTexel * vec2(1.0, 0.5)).rgb
+          + texture(tFog, vUv + uFogTexel * vec2(-0.5, 1.0)).rgb + texture(tFog, vUv - uFogTexel * vec2(-0.5, 1.0)).rgb) * 0.15;
+      c += uFogCol * f / uHDR;
       c += texture(tB1, vUv).rgb * 0.22 + texture(tB2, vUv).rgb * 0.4;
       c *= uExposure;
       c = aces(c);
@@ -633,6 +790,8 @@ function makeRT(w, h, depth) {
   const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
     type: RT_TYPE, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: !!depth,
   });
+  // 8-bit fallback: sRGB storage (encoded on write, decoded on read) keeps the darks from banding
+  if (!floatOK) rt.texture.colorSpace = THREE.SRGBColorSpace;
   if (depth) { rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height); rt.depthTexture.type = THREE.UnsignedIntType; }
   return rt;
 }
@@ -675,31 +834,38 @@ const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
 const mix3 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
 const bounceTmp = new THREE.Vector3();
+// t is the sun's journey: 0 sunrise, 0.5 noon, 1 sunset, and a little past 1 the blue hour.
+const T_MIN = 0, T_MAX = 1.055;
+const DAY = [
+  //       sunlight colour         sky overhead               sky at the horizon
+  { t: -0.10, sun: [1.00, 0.45, 0.42], zen: [0.030, 0.050, 0.150], hor: [0.22, 0.17, 0.32] },  // before sunrise
+  { t: 0.00, sun: [1.00, 0.54, 0.60], zen: [0.20, 0.21, 0.50], hor: [1.70, 0.84, 0.95] },     // rose
+  { t: 0.09, sun: [1.00, 0.73, 0.40], zen: [0.27, 0.38, 0.86], hor: [1.80, 1.25, 0.70] },     // gold
+  { t: 0.27, sun: [1.00, 0.96, 0.91], zen: [0.30, 0.56, 1.35], hor: [1.55, 1.70, 1.90] },     // white midday
+  { t: 0.73, sun: [1.00, 0.96, 0.91], zen: [0.30, 0.56, 1.35], hor: [1.55, 1.70, 1.90] },
+  { t: 0.89, sun: [1.00, 0.64, 0.25], zen: [0.24, 0.31, 0.72], hor: [1.95, 1.05, 0.45] },     // late gold
+  { t: 0.985, sun: [1.00, 0.37, 0.07], zen: [0.13, 0.12, 0.34], hor: [2.15, 0.60, 0.17] },    // deep orange
+  { t: 1.035, sun: [1.00, 0.30, 0.10], zen: [0.040, 0.080, 0.30], hor: [0.34, 0.30, 0.58] },  // blue hour
+  { t: 1.10, sun: [1.00, 0.30, 0.10], zen: [0.018, 0.030, 0.11], hor: [0.09, 0.09, 0.20] },
+];
+function dayAt(t) {
+  let i = 0;
+  while (i < DAY.length - 2 && t > DAY[i + 1].t) i++;
+  const a = DAY[i], b = DAY[i + 1], k = smooth(a.t, b.t, t);
+  return { sun: mix3(a.sun, b.sun, k), zen: mix3(a.zen, b.zen, k), hor: mix3(a.hor, b.hor, k) };
+}
 function applyDay(t) {
   const az = (t - 0.5) * 2.3;
   const el = 0.035 + 0.95 * Math.sin(Math.PI * t);
   const ce = Math.cos(el);
   const L = U.uL.value.set(Math.sin(az) * ce, Math.sin(el), -Math.cos(az) * ce).normalize();
-  const evening = smooth(0.3, 0.7, t);
   const e = clamp(el / 0.95, 0, 1);
   const up = smooth(-0.03, 0.1, el);                // sun above the horizon
-  const low = mix3([1.0, 0.46, 0.30], [1.0, 0.30, 0.09], evening);
-  const mid = [1.0, 0.70, 0.43];
-  const high = [1.0, 0.91, 0.79];
-  const col = e < 0.32 ? mix3(low, mid, smooth(0, 0.32, e)) : mix3(mid, high, smooth(0.32, 1, e));
+  const lit = smooth(-0.12, 0.04, el);
+  const { sun: col, zen, hor } = dayAt(t);
   const I = 6.0 * up * (0.55 + 0.45 * smooth(0, 0.5, e));
   const sun = [col[0] * I, col[1] * I, col[2] * I];
   U.uSunCol.value.set(sun[0], sun[1], sun[2]).multiplyScalar(HDR);
-
-  const night = [[0.012, 0.016, 0.045], [0.05, 0.05, 0.11]];
-  const dawn = [[0.14, 0.16, 0.42], [1.7, 0.66, 0.50]];
-  const dusk = [[0.12, 0.09, 0.30], [2.0, 0.55, 0.20]];
-  const noon = [[0.36, 0.62, 1.45], [1.7, 1.85, 2.0]];
-  const edge = [mix3(dawn[0], dusk[0], evening), mix3(dawn[1], dusk[1], evening)];
-  const day = smooth(0.08, 0.5, e);
-  let zen = mix3(edge[0], noon[0], day), hor = mix3(edge[1], noon[1], day);
-  const lit = smooth(-0.12, 0.04, el);
-  zen = mix3(night[0], zen, lit); hor = mix3(night[1], hor, lit);
   U.uZenith.value.set(...zen).multiplyScalar(HDR);
   U.uHorizon.value.set(...hor).multiplyScalar(HDR);
   U.uGlow.value.set(col[0], col[1] * 0.85, col[2] * 0.7).multiplyScalar((0.9 + 1.4 * (1 - e)) * lit * HDR);
@@ -760,10 +926,10 @@ let dragX = null;
 canvas.addEventListener("pointermove", e => {
   if (e.pointerType === "mouse" || e.pointerType === "pen") {
     if (mode === "tilt") return;
-    tTarget = lerp(0.02, 0.98, clamp(e.clientX / window.innerWidth, 0, 1));
+    tTarget = lerp(T_MIN, T_MAX, clamp(e.clientX / window.innerWidth, 0, 1));
     touched();
   } else if (dragX !== null) {
-    tTarget = clamp(tTarget + (e.clientX - dragX) / window.innerWidth * 1.15, 0.02, 0.98);
+    tTarget = clamp(tTarget + (e.clientX - dragX) / window.innerWidth * 1.15 * (T_MAX - T_MIN), T_MIN, T_MAX);
     dragX = e.clientX;
     touched();
   }
@@ -778,7 +944,7 @@ function onTilt(e) {
   const ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
   const v = ang === 90 ? e.beta : (ang === -90 || ang === 270) ? -e.beta : e.gamma;
   if (mode !== "tilt") { mode = "tilt"; hint.textContent = "Tilt your phone to move the sun"; hint.classList.remove("gone"); }
-  tTarget = clamp(0.5 + v / 70, 0.02, 0.98);
+  tTarget = lerp(T_MIN, T_MAX, clamp(0.5 + v / 70, 0, 1));
   touched();
 }
 const tiltBtn = document.getElementById("tilt");
@@ -815,7 +981,7 @@ function tick(now) {
   } else {
     if (!reduceMotion && now - lastInput > 16000 && mode !== "tilt") {
       tTarget += driftDir * dt * 0.008;
-      if (tTarget > 0.95) driftDir = -1; else if (tTarget < 0.05) driftDir = 1;
+      if (tTarget > T_MAX - 0.015) driftDir = -1; else if (tTarget < T_MIN + 0.03) driftDir = 1;
     }
     tCur += (tTarget - tCur) * (1 - Math.exp(-dt * 2.4));
   }
@@ -874,7 +1040,7 @@ function tick(now) {
   }
   requestAnimationFrame(tick);
 }
-window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; } };
+window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer } };
 requestAnimationFrame(tick);
 })();
 </script>
