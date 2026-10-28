@@ -711,7 +711,7 @@ sky.position.set(0, 2.4, -1);
 scene.add(sky);
 
 /* ---------- Dust motes that only shine inside the beams ---------- */
-const DUST = isTouch ? 700 : 1100;
+const DUST = isTouch ? 1100 : 1800;
 const dustGeo = new THREE.BufferGeometry();
 {
   const seed = new Float32Array(DUST * 4);
@@ -734,19 +734,20 @@ const dustMat = new THREE.ShaderMaterial({
       float t = uTime * (0.05 + 0.08 * aSeed.w);
       vec3 p = base + vec3(sin(t * 1.3 + aSeed.x * 40.0) * 0.3, sin(t * 0.7 + aSeed.y * 30.0) * 0.22, cos(t * 1.1 + aSeed.z * 20.0) * 0.3);
       vec3 v = sunVis(p, 0.006);
-      float tw = 0.55 + 0.45 * sin(uTime * (0.8 + aSeed.w * 2.5) + aSeed.x * 100.0);
-      vB = v * tw;
+      float tw = 0.6 + 0.4 * sin(uTime * (0.5 + aSeed.w * 1.2) + aSeed.x * 100.0);   // a slow glint as it turns
       vec4 mv = viewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mv;
-      gl_PointSize = max(v.r, max(v.g, v.b)) > 0.02 ? uPx * (0.6 + aSeed.w) / -mv.z : 0.0;
+      // a few motes are larger and softer, like specks drifting out of focus; the same light spreads wider
+      float size = 0.9 + 2.2 * aSeed.w * aSeed.w * aSeed.w;
+      vB = v * tw / (size * size);
+      gl_PointSize = max(v.r, max(v.g, v.b)) > 0.02 ? uPx * 1.5 * size / -mv.z : 0.0;
     }`,
   fragmentShader: /* glsl */`
     uniform vec3 uSunCol;
     varying vec3 vB;
     void main() {
-      float d = length(gl_PointCoord - 0.5);
-      float a = smoothstep(0.5, 0.0, d);
-      gl_FragColor = vec4(uSunCol * 0.35 * vB * a * a, 1.0);
+      vec2 d = gl_PointCoord - 0.5;
+      gl_FragColor = vec4(uSunCol * 0.9 * vB * exp(-dot(d, d) * 18.0), 1.0);
     }`,
 });
 const dust = new THREE.Points(dustGeo, dustMat);
@@ -806,11 +807,15 @@ const fogMat = new THREE.ShaderMaterial({
     }`,
 });
 
+const fogColU = { value: new THREE.Vector3() };   // colour of the beams' light, shared by bloom and composite
 const brightMat = new THREE.ShaderMaterial({
-  uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uThresh: { value: 1.2 }, uHDR: U.uHDR },
+  uniforms: {
+    tSrc: { value: null }, tFog: { value: null }, uTexel: { value: new THREE.Vector2() }, uThresh: { value: 1.2 },
+    uFogCol: fogColU, uBeamGlow: { value: 0.55 }, uHDR: U.uHDR,
+  },
   vertexShader: FS_VERT, depthTest: false, depthWrite: false,
   fragmentShader: /* glsl */`
-    uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uThresh, uHDR; varying vec2 vUv;
+    uniform sampler2D tSrc, tFog; uniform vec2 uTexel; uniform vec3 uFogCol; uniform float uThresh, uBeamGlow, uHDR; varying vec2 vUv;
     void main() {
       vec3 c = vec3(0.0);
       c += texture(tSrc, vUv + uTexel * vec2(-1.0, -1.0)).rgb;
@@ -820,6 +825,8 @@ const brightMat = new THREE.ShaderMaterial({
       c *= 0.25 / uHDR;
       float l = max(c.r, max(c.g, c.b));
       c *= smoothstep(uThresh, uThresh * 2.5, l);
+      // the beams glow softly on their own, without a threshold
+      c += uFogCol * texture(tFog, vUv).rgb / uHDR * uBeamGlow;
       gl_FragColor = vec4(min(c, vec3(40.0)), 1.0);
     }`,
 });
@@ -838,7 +845,7 @@ const blurMat = new THREE.ShaderMaterial({
 const compMat = new THREE.ShaderMaterial({
   uniforms: {
     tScene: { value: null }, tFog: { value: null }, tB1: { value: null }, tB2: { value: null },
-    uFogTexel: { value: new THREE.Vector2() }, uFogCol: { value: new THREE.Vector3() },
+    uFogTexel: { value: new THREE.Vector2() }, uFogCol: fogColU,
     uExposure: { value: 1 }, uFade: { value: 0 }, uAspect: { value: 1 }, uTime: U.uTime, uHDR: U.uHDR,
   },
   vertexShader: FS_VERT, depthTest: false, depthWrite: false,
@@ -856,8 +863,9 @@ const compMat = new THREE.ShaderMaterial({
       c += texture(tB1, vUv).rgb * 0.22 + texture(tB2, vUv).rgb * 0.4;
       c *= uExposure;
       c = aces(c);
-      vec2 v = (vUv - 0.5) * vec2(uAspect, 1.0);
-      c *= mix(1.0, smoothstep(1.15, 0.25, length(v)), 0.6);
+      // a soft vignette, the same on any screen shape, falling off toward a warm dark
+      float vig = smoothstep(0.6, 1.45, length((vUv - 0.5) * 2.0));
+      c *= mix(vec3(1.0), vec3(0.66, 0.6, 0.56), vig);
       c = pow(c, vec3(1.0 / 2.2));
       c += (h12(gl_FragCoord.xy + fract(uTime) * 371.0) - 0.5) * (3.0 / 255.0);
       gl_FragColor = vec4(c * uFade, 1.0);
@@ -924,7 +932,7 @@ const DAY = [
   { t: 0.73, sun: [1.00, 0.96, 0.91], zen: [0.30, 0.56, 1.35], hor: [1.55, 1.70, 1.90] },
   { t: 0.89, sun: [1.00, 0.64, 0.25], zen: [0.24, 0.31, 0.72], hor: [1.95, 1.05, 0.45] },     // late gold
   { t: 0.985, sun: [1.00, 0.37, 0.07], zen: [0.13, 0.12, 0.34], hor: [2.15, 0.60, 0.17] },    // deep orange
-  { t: 1.035, sun: [1.00, 0.30, 0.10], zen: [0.040, 0.080, 0.30], hor: [0.34, 0.30, 0.58] },  // blue hour
+  { t: 1.035, sun: [1.00, 0.30, 0.10], zen: [0.035, 0.085, 0.32], hor: [0.25, 0.30, 0.62] },  // blue hour
   { t: 1.10, sun: [1.00, 0.30, 0.10], zen: [0.018, 0.030, 0.11], hor: [0.09, 0.09, 0.20] },
 ];
 function dayAt(t) {
@@ -949,8 +957,10 @@ function applyDay(t) {
   U.uHorizon.value.set(...hor).multiplyScalar(HDR);
   U.uGlow.value.set(col[0], col[1] * 0.85, col[2] * 0.7).multiplyScalar((0.9 + 1.4 * (1 - e)) * lit * HDR);
   const skyAvg = mix3(zen, hor, 0.6);
-  U.uSkyCol.value.set(...skyAvg).multiplyScalar(0.42 * HDR);
-  U.uAmb.value.set(0.006 + skyAvg[0] * 0.008, 0.005 + skyAvg[1] * 0.008, 0.006 + skyAvg[2] * 0.010).multiplyScalar(HDR);
+  // once the sun is down the blue sky is the room's only light, so let more of it in
+  const dusk = 1 + 1.4 * (1 - up);
+  U.uSkyCol.value.set(...skyAvg).multiplyScalar(0.42 * dusk * HDR);
+  U.uAmb.value.set(0.006 + skyAvg[0] * 0.008, 0.005 + skyAvg[1] * 0.008, 0.006 + skyAvg[2] * 0.010).multiplyScalar(dusk * HDR);
 
   // where does the beam land? trace from the screen's centre back along the light
   const o = [WIN.x0 + WIN.w / 2, WIN.y0 + WIN.h / 2, 0], d = [-L.x, -L.y, -L.z];
@@ -1094,6 +1104,7 @@ function tick(now) {
   pass(fogMat, fogRT);
 
   brightMat.uniforms.tSrc.value = sceneRT.texture;
+  brightMat.uniforms.tFog.value = fogRT.texture;
   brightMat.uniforms.uTexel.value.set(1 / W, 1 / H);
   pass(brightMat, b1a);
   blurMat.uniforms.tSrc.value = b1a.texture; blurMat.uniforms.uDir.value.set(1 / b1a.width, 0); pass(blurMat, b1b);
