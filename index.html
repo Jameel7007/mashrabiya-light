@@ -652,7 +652,7 @@ const roomMat = new THREE.ShaderMaterial({
           albedo = vec3(0.66, 0.46, 0.30) * m * fine;
         }
       }
-      vec3 vis = sunVis(P, 0.0095);
+      vec3 vis = sunVis(P, 0.0065);   // a little sharper than the sun's true penumbra, for crisp stars
       float ndl = max(dot(N, uL), 0.0);
       vec3 direct = uSunCol * ndl * vis;
       // skylight entering through the opening, treated as a small area light
@@ -1021,7 +1021,7 @@ const fogColU = { value: new THREE.Vector3() };   // colour of the beams' light,
 const brightMat = new THREE.ShaderMaterial({
   uniforms: {
     tSrc: { value: null }, tFog: { value: null }, uTexel: { value: new THREE.Vector2() }, uThresh: { value: 1.2 },
-    uFogCol: fogColU, uBeamGlow: { value: 0.55 }, uHDR: U.uHDR,
+    uFogCol: fogColU, uBeamGlow: { value: 0.45 }, uHDR: U.uHDR,
   },
   vertexShader: FS_VERT, depthTest: false, depthWrite: false,
   fragmentShader: /* glsl */`
@@ -1055,22 +1055,31 @@ const blurMat = new THREE.ShaderMaterial({
 const compMat = new THREE.ShaderMaterial({
   uniforms: {
     tScene: { value: null }, tFog: { value: null }, tB1: { value: null }, tB2: { value: null },
-    uFogTexel: { value: new THREE.Vector2() }, uFogCol: fogColU,
+    uFogTexel: { value: new THREE.Vector2() }, uFogCol: fogColU, uTexel: { value: new THREE.Vector2() },
     uExposure: { value: 1 }, uFade: { value: 0 }, uAspect: { value: 1 }, uTime: U.uTime, uHDR: U.uHDR,
   },
   vertexShader: FS_VERT, depthTest: false, depthWrite: false,
   fragmentShader: /* glsl */`
-    uniform sampler2D tScene, tFog, tB1, tB2; uniform vec2 uFogTexel; uniform vec3 uFogCol;
+    uniform sampler2D tScene, tFog, tB1, tB2; uniform vec2 uFogTexel, uTexel; uniform vec3 uFogCol;
     uniform float uExposure, uFade, uAspect, uTime, uHDR; varying vec2 vUv;
     vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
     float h12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
     void main() {
+      // Contrast-adaptive sharpening of the room itself (not the beams or the glow): each pixel is
+      // pushed away from its four neighbours, less where the local contrast is already high, so
+      // edges get crisper without halos. The amount is judged on tone-compressed values.
       vec3 c = texture(tScene, vUv).rgb / uHDR;
+      vec3 n = texture(tScene, vUv + vec2(0.0, uTexel.y)).rgb / uHDR, s = texture(tScene, vUv - vec2(0.0, uTexel.y)).rgb / uHDR;
+      vec3 e = texture(tScene, vUv + vec2(uTexel.x, 0.0)).rgb / uHDR, w = texture(tScene, vUv - vec2(uTexel.x, 0.0)).rgb / uHDR;
+      vec3 lo = min(c, min(min(n, s), min(e, w))), hi = max(c, max(max(n, s), max(e, w)));
+      lo /= 1.0 + lo; hi /= 1.0 + hi;
+      vec3 k = -0.17 * sqrt(clamp(min(lo, 1.0 - hi) / max(hi, 1e-4), 0.0, 1.0));
+      c = max((c + (n + s + e + w) * k) / (1.0 + 4.0 * k), 0.0);
       vec3 f = texture(tFog, vUv).rgb * 0.4;
       f += (texture(tFog, vUv + uFogTexel * vec2(1.0, 0.5)).rgb + texture(tFog, vUv - uFogTexel * vec2(1.0, 0.5)).rgb
           + texture(tFog, vUv + uFogTexel * vec2(-0.5, 1.0)).rgb + texture(tFog, vUv - uFogTexel * vec2(-0.5, 1.0)).rgb) * 0.15;
       c += uFogCol * f / uHDR;
-      c += texture(tB1, vUv).rgb * 0.22 + texture(tB2, vUv).rgb * 0.4;
+      c += texture(tB1, vUv).rgb * 0.2 + texture(tB2, vUv).rgb * 0.3;
       c *= uExposure;
       c = aces(c);
       // a soft vignette, the same on any screen shape, falling off toward a warm dark
@@ -1083,22 +1092,37 @@ const compMat = new THREE.ShaderMaterial({
 });
 
 let W = 1, H = 1, scale = 1, sceneRT, fogRT, b1a, b1b, b2a, b2b;
-function makeRT(w, h, depth) {
+// Antialiasing: the room renders with 4 samples per pixel where the GPU can store this colour
+// format multisampled, which smooths the lattice's edges against the bright gaps (three resolves
+// the depth too, so the beam pass still sees it). Only up to about 2.2 million pixels: phones and
+// ordinary monitors gain the most, while a high-density laptop already renders at its screen's
+// own density, where multisampling would cost several times more for little gain.
+const MSAA = qs.has("noaa") ? 0 : (() => {
+  try {
+    const s = gl.getInternalformatParameter(gl.RENDERBUFFER, floatOK ? gl.RGBA16F : gl.SRGB8_ALPHA8, gl.SAMPLES);
+    return s && s.length ? Math.min(4, s[0]) : 0;
+  } catch (e) { return 0; }
+})();
+function makeRT(w, h, depth, samples = 0) {
   const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
-    type: RT_TYPE, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: !!depth,
+    type: RT_TYPE, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: !!depth, samples,
   });
   // 8-bit fallback: sRGB storage (encoded on write, decoded on read) keeps the darks from banding
   if (!floatOK) rt.texture.colorSpace = THREE.SRGBColorSpace;
   if (depth) { rt.depthTexture = new THREE.DepthTexture(rt.width, rt.height); rt.depthTexture.type = THREE.UnsignedIntType; }
   return rt;
 }
-// Render scale (canvas pixels per CSS pixel). Phones are capped well below their 3x screens: the
-// scene is soft by nature and the lattice still gets several pixels per bar. Big desktop windows
-// are held to about 4 million pixels.
+// Render scale (canvas pixels per CSS pixel), within a pixel budget. iPhones and iPads (an "Apple
+// GPU") render at up to 2x, other phones at up to 1.5x, desktops at up to 2x; the auto-scaler below
+// steps down on any device that cannot keep up.
+const gpuName = (() => {
+  const d = gl.getExtension("WEBGL_debug_renderer_info");
+  return String(gl.getParameter(d ? d.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || "");
+})();
 function maxScale() {
-  const dpr = window.devicePixelRatio || 1;
-  if (isTouch) return Math.min(dpr, 1.35);
-  return Math.min(dpr, 2, Math.sqrt(4.2e6 / (window.innerWidth * window.innerHeight)));
+  const dpr = window.devicePixelRatio || 1, area = window.innerWidth * window.innerHeight;
+  if (isTouch) return /apple/i.test(gpuName) ? Math.min(dpr, 2, Math.sqrt(1.6e6 / area)) : Math.min(dpr, 1.5, Math.sqrt(1e6 / area));
+  return Math.min(dpr, 2, Math.sqrt(4.2e6 / area));
 }
 if (!qs.has("q")) scale = maxScale(); else scale = parseFloat(qs.get("q")) || 1;
 function resize() {
@@ -1107,7 +1131,8 @@ function resize() {
   W = Math.max(2, Math.round(cw * scale)); H = Math.max(2, Math.round(ch * scale));
   renderer.setSize(W, H, false);
   for (const rt of [sceneRT, fogRT, b1a, b1b, b2a, b2b]) if (rt) rt.dispose();
-  sceneRT = makeRT(W, H, true);
+  sceneRT = makeRT(W, H, true, W * H <= 2.2e6 ? MSAA : 0);
+  compMat.uniforms.uTexel.value.set(1 / W, 1 / H);
   fogRT = makeRT(W >> 1, H >> 1);
   b1a = makeRT(W >> 2, H >> 2); b1b = makeRT(W >> 2, H >> 2);
   b2a = makeRT(W >> 3, H >> 3); b2b = makeRT(W >> 3, H >> 3);
@@ -1485,10 +1510,10 @@ function tick(now) {
   // Adapt if the device is struggling: below about 54 fps, step the resolution and the beam march
   // down. One-off spikes (a pattern swap, a tab switch) are left out, and a steady 30 fps is taken
   // as a capped display (iOS Low Power Mode), not a slow GPU.
-  if (frame > 40 && perfChecks < 5 && !qs.has("q") && dt < 0.05) {
+  if (frame > 30 && perfChecks < 5 && !qs.has("q") && dt < 0.05) {
     perfAcc += dt; perfN++;
     if (Math.abs(dt - 1 / 30) < 0.0025) perfCapped++;
-    if (perfN >= 60) {
+    if (perfN >= 45) {
       const avg = perfAcc / perfN, capped = perfCapped > perfN * 0.8;
       perfAcc = 0; perfN = 0; perfCapped = 0; perfChecks++;
       if (avg > 0.0185 && !capped && scale > 0.7) {
