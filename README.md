@@ -56,12 +56,13 @@ floor.
 path. The view is shown dimmer than its real brightness so it reads through the gaps instead of
 burning white.
 
-**Sound.** A real field recording of a courtyard garden fountain with birds (see Credits). A
-52-second stretch with no passers-by was cut from it, lifted a little in level and saved as a
-0.5 MB MP3. The page fetches it on the first tap, decodes it with the Web Audio API and loops it:
-each pass starts three seconds before the last one ends and the two cross with equal-power fades,
-so the loudness holds steady and the join is never heard. After sunset a gentle low-pass filter
-softens the sound as the birds fall quiet.
+**Sound.** A real field recording of a blackbird singing in a garden (see Credits). Everything
+below the song's range (under about 450 Hz) is filtered out, which removes a low background rush,
+and the recording is reordered so that its loop point falls in a quiet pause between phrases. It
+is saved as a 0.8 MB MP3 of about 80 seconds. The page fetches it on the first tap, decodes it
+with the Web Audio API and loops it: each pass starts three seconds before the last one ends and
+the two cross with equal-power fades, so the loudness holds steady and the join is never heard.
+In the blue hour the blackbird grows softer and further off.
 
 **Performance.** Phones render at 1.35× their CSS pixels (not their full 3×) with fewer beam
 steps; large desktop windows are held to about four million pixels. If the frame rate stays below
@@ -87,7 +88,6 @@ then open http://localhost:8000. Optional URL parameters for testing:
 
 ## Credits
 
-- Fountain and birds: [fountain_ambience_2_courtyard_abbey_gardens_stereo.wav](https://freesound.org/people/nickmaysoundmusic/sounds/460559/)
-  by nickmaysoundmusic on Freesound, recorded in the Abbey Gardens, Bury St Edmunds, and released
-  under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) (public domain). Trimmed
-  and re-encoded for this page as `audio/courtyard.mp3`.
+- Blackbird: [Blackbird singing in garden with rustling trees in background](https://freesound.org/people/Cinetony/sounds/565058/)
+  by Cinetony on Freesound, released under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)
+  (public domain). Filtered, reordered and re-encoded for this page as `audio/blackbird.mp3`.

@@ -1281,7 +1281,7 @@ if (isTouch && window.DeviceOrientationEvent) {
   }
 }
 
-/* ---------- Sound: a courtyard fountain with birds, from a real recording ---------- */
+/* ---------- Sound: a blackbird singing in a garden, from a real recording ---------- */
 // One small public-domain field recording (credited in the README), fetched and decoded the first
 // time sound starts and looped with long crossfades so the join is never heard. It stays silent
 // until the first tap or click anywhere, and turning it off is remembered.
@@ -1289,11 +1289,11 @@ const sound = (() => {
   const AC = window.AudioContext || window.webkitAudioContext;
   const btn = document.getElementById("sound");
   if (!AC) { btn.hidden = true; return { update() {} }; }
-  const FILE = "audio/courtyard.mp3", FADE = 3;   // seconds each pass of the recording overlaps the next
+  const FILE = "audio/blackbird.mp3", FADE = 3;   // seconds each pass of the recording overlaps the next
   // equal-power fades: the two passes keep a steady loudness all through the cross
   const RISE = new Float32Array(64).map((_, i) => Math.sin(i / 63 * Math.PI / 2)), FALL = RISE.slice().reverse();
-  let ctx = null, master = null, dull = null, buffer = null, loading = null;
-  let wanted = true, armed = false, day = 0.5, next = 0, dullAt = -1;
+  let ctx = null, master = null, dull = null, hush = null, buffer = null, loading = null;
+  let wanted = true, armed = false, day = 0.5, next = 0, nightAt = -1;
   try { wanted = localStorage.getItem("mashrabiya-sound") !== "off"; } catch (e) {}
 
   function build() {
@@ -1302,7 +1302,8 @@ const sound = (() => {
     try { if (navigator.audioSession) navigator.audioSession.type = "ambient"; } catch (e) {}   // mix with other audio on iOS
     master = ctx.createGain(); master.gain.value = 0; master.connect(ctx.destination);
     dull = ctx.createBiquadFilter(); dull.type = "lowpass"; dull.frequency.value = 18000; dull.Q.value = 0.5;
-    dull.connect(master);
+    hush = ctx.createGain();
+    dull.connect(hush).connect(master);
   }
   // fetched and decoded once; if it fails (offline, say) the next start tries again
   function load() {
@@ -1368,8 +1369,13 @@ const sound = (() => {
       day = t;
       if (!ctx || ctx.state !== "running") return;
       if (buffer && ctx.currentTime > next - 1.5) queue();
-      const f = 18000 - 13000 * smooth(0.97, 1.04, day);   // the birds fall quiet with the blue hour
-      if (Math.abs(f - dullAt) > 200) { dull.frequency.setTargetAtTime(f, ctx.currentTime, 0.6); dullAt = f; }
+      // in the blue hour the blackbird grows softer and further off
+      const night = smooth(0.97, 1.04, day);
+      if (Math.abs(night - nightAt) > 0.01) {
+        dull.frequency.setTargetAtTime(18000 - 12000 * night, ctx.currentTime, 0.6);
+        hush.gain.setTargetAtTime(1 - 0.6 * night, ctx.currentTime, 0.6);
+        nightAt = night;
+      }
     },
     get state() { return { ctx: ctx && ctx.state, on: wanted && armed, wanted, armed, loaded: !!buffer }; },
     get nodes() { return { ctx, master }; },
