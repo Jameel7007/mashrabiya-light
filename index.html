@@ -364,6 +364,8 @@ const U = {
   uGlow: { value: new THREE.Vector3(1, 0.7, 0.4) },
   uTime: { value: 0 },
   uHDR: { value: HDR },
+  uSkyShow: { value: 0.5 },   // how bright the view through the screen is shown
+  uNight: { value: 0 },
 };
 
 const SUN_GLSL = /* glsl */`
@@ -579,6 +581,7 @@ const paneMat = new THREE.ShaderMaterial({
     ${SUN_GLSL}
     ${NOISE_GLSL}
     uniform vec3 uSunCol, uZenith, uHorizon;
+    uniform float uSkyShow;
     varying vec3 vPos;
     void main() {
       vec4 m = textureLod(uMask, (vPos.xy - uWin.xy) / uWin.zw, 0.0);
@@ -591,7 +594,8 @@ const paneMat = new THREE.ShaderMaterial({
       if (uL.z < -0.01 && uL.y > -0.05) { float s = (uZ.x - vPos.z) / uL.z; reach = rectVis(vPos.xy + s * uL.xy, 0.002 + s * 0.0095); }
       float toward = pow(max(dot(V, uL), 0.0), 5.0);         // looking toward the sun through the pane
       vec3 sky = mix(uHorizon, uZenith, pow(clamp(V.y, 0.0, 1.0), 0.45));
-      vec3 light = uSunCol * reach * (0.25 * max(-uL.z, 0.0) + 1.5 * toward) + sky * 0.5;
+      // (the sky term dims with the shown view, but only halfway, so panes still glow at dusk)
+      vec3 light = uSunCol * reach * (0.25 * max(-uL.z, 0.0) + 1.5 * toward) + sky * 0.5 * mix(1.0, uSkyShow * 2.0, 0.5);
       // hand-blown glass: streaks of deeper colour and a few seed bubbles
       float streak = fbm(vPos.xy * vec2(7.0, 19.0));
       tint = pow(tint, vec3(0.7 + 0.6 * streak));
@@ -607,24 +611,99 @@ const hemi = new THREE.HemisphereLight(0xffffff, 0xffffff, 0.2);
 const bounceLight = new THREE.PointLight(0xffffff, 1, 0, 2);
 scene.add(sunLight, sunLight.target, hemi, bounceLight);
 
-/* ---------- Sky beyond the screen ---------- */
+/* ---------- The view beyond the screen: sky, a distant minaret and dome, two palms ---------- */
+// Every pixel follows its own ray from the camera, so the far shapes slide against the lattice as the
+// camera drifts. Each shape stands on an upright plane at its real distance and softens with it,
+// like a lens focused on the screen.
 const skyMat = new THREE.ShaderMaterial({
   uniforms: U, side: THREE.BackSide, depthWrite: true,
   vertexShader: /* glsl */`
-    varying vec3 vDir;
-    void main() { vDir = position; gl_Position = projectionMatrix * viewMatrix * modelMatrix * vec4(position, 1.0); }`,
+    varying vec3 vWorld;
+    void main() { vec4 wp = modelMatrix * vec4(position, 1.0); vWorld = wp.xyz; gl_Position = projectionMatrix * viewMatrix * wp; }`,
   fragmentShader: /* glsl */`
-    uniform vec3 uL, uSunCol, uZenith, uHorizon, uGlow; uniform float uHDR;
-    varying vec3 vDir;
+    uniform vec3 uL, uSunCol, uZenith, uHorizon, uGlow;
+    uniform float uSkyShow, uNight;
+    varying vec3 vWorld;
+    float h11(float n) { return fract(sin(n * 127.1) * 43758.5453); }
+    float h21(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float cover(float d, float w) { return 1.0 - smoothstep(-w, w, d); }
+    float sdBox(vec2 p, vec2 c, vec2 h) { vec2 d = abs(p - c) - h; return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }
+    float sdSeg(vec2 p, vec2 a, vec2 b, float ra, float rb) {
+      vec2 pa = p - a, ba = b - a;
+      float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+      return length(pa - ba * h) - mix(ra, rb, h);
+    }
+    // a Cairene minaret: square shaft, octagonal and round stages with balconies, a bulb and finial
+    float minaret(vec2 p) {
+      float d = sdBox(p, vec2(0.0, 11.0), vec2(2.6, 11.0));
+      d = min(d, sdBox(p, vec2(0.0, 22.5), vec2(3.3, 0.55)));
+      d = min(d, sdBox(p, vec2(0.0, 28.6), vec2(2.0, 5.6)));
+      d = min(d, sdBox(p, vec2(0.0, 34.6), vec2(2.7, 0.5)));
+      d = min(d, sdBox(p, vec2(0.0, 38.4), vec2(1.45, 3.3)));
+      d = min(d, sdBox(p, vec2(0.0, 42.0), vec2(1.95, 0.4)));
+      d = min(d, sdBox(p, vec2(0.0, 44.2), vec2(1.15, 1.9)));
+      d = min(d, (length((p - vec2(0.0, 47.4)) / vec2(1.5, 2.2)) - 1.0) * 1.5);
+      return min(d, sdBox(p, vec2(0.0, 51.0), vec2(0.14, 2.0)));
+    }
+    // a pointed dome on its drum, with a low prayer hall beside it
+    float mosque(vec2 p) {
+      float d = min(sdBox(p, vec2(0.0, 7.0), vec2(10.5, 7.0)), sdBox(p, vec2(-19.0, 5.0), vec2(9.0, 5.0)));
+      vec2 q = p - vec2(0.0, 14.0);
+      d = min(d, max(max(length(q + vec2(3.0, 0.0)), length(q - vec2(3.0, 0.0))) - 13.0, -q.y));
+      return min(d, sdBox(p, vec2(0.0, 27.5), vec2(0.15, 1.6)));
+    }
+    // a low line of flat roofs
+    float roofs(vec2 p) { float c = floor(p.x / 8.0); return p.y - (4.0 + 6.0 * h11(c) * h11(c + 7.3)); }
+    // a date palm: a gently curved trunk and a crown of arching fronds, the lower ones drooping
+    float palm(vec2 p, vec2 base, float H, float lean, float seed) {
+      vec2 top = base + vec2(lean, H), mid = base + vec2(lean * 0.3, H * 0.5);
+      float d = min(sdSeg(p, base, mid, 0.26, 0.21), sdSeg(p, mid, top, 0.21, 0.17));
+      vec2 q = p - top;
+      d = min(d, length(q) - 0.5);
+      for (int i = 0; i < 15; i++) {
+        float fi = float(i);
+        float ang = mix(-0.95, 4.09, (fi + 0.6 * h11(seed + fi)) / 15.0);
+        vec2 dir = vec2(cos(ang), sin(ang));
+        float L = 3.2 + 1.6 * h11(seed + fi * 3.1);
+        float k = 0.04 + 0.04 * h11(seed + fi * 5.7) + 0.07 * (1.0 - max(dir.y, 0.0));
+        // nearest point on the drooping midrib c(s) = dir s - (0, k s^2), by Newton steps
+        float s = clamp(dot(q, dir), 0.0, L);
+        for (int j = 0; j < 3; j++) {
+          vec2 e = q - dir * s + vec2(0.0, k * s * s), dc = dir - vec2(0.0, 2.0 * k * s);
+          s = clamp(s + dot(e, dc) / (dot(dc, dc) + 2.0 * k * e.y), 0.0, L);
+        }
+        float u = s / L;
+        // a tapering leaf with serrated leaflet tips, on a thin midrib
+        float fw = 0.40 * smoothstep(0.0, 0.15, u) * pow(1.0 - u, 0.8) * (0.6 + 0.4 * fract(s * 7.0 + fi * 0.37));
+        d = min(d, length(q - dir * s + vec2(0.0, k * s * s)) - max(fw, 0.035));
+      }
+      return d;
+    }
     void main() {
-      vec3 d = normalize(vDir);
-      float h = clamp(d.y, 0.0, 1.0);
-      vec3 col = mix(uHorizon, uZenith, pow(h, 0.45));
-      float mu = max(dot(d, normalize(uL)), 0.0);
+      vec3 ro = cameraPosition, rd = normalize(vWorld - cameraPosition);
+      // sky: the horizon colour rising into the overhead colour, a glow around the sun
+      vec3 col = mix(uHorizon, uZenith, pow(smoothstep(0.0, 0.62, rd.y), 0.75));
+      float mu = max(dot(rd, uL), 0.0);
       col += uGlow * (0.5 * pow(mu, 6.0) + 2.0 * pow(mu, 60.0));
       col += uSunCol * smoothstep(0.99955, 0.9998, mu) * 30.0;
-      col = mix(col, uHorizon * 0.35, smoothstep(0.0, -0.08, d.y));
-      gl_FragColor = vec4(col * 1.5, 1.0);
+      // the first stars after sunset
+      vec2 sc = floor(vec2(atan(rd.x, -rd.z), rd.y) * 700.0);
+      col += uZenith * 6.0 * uNight * step(0.9975, h21(sc)) * smoothstep(0.12, 0.35, rd.y);
+      // the ground, hazing into the horizon
+      if (rd.y < 0.0) col = mix(uHorizon * 0.62, uHorizon * 0.14 + uZenith * 0.04, exp(ro.y / rd.y / 70.0));
+      if (rd.z < -0.01) {
+        // silhouettes, far to near
+        vec3 far = uHorizon * 0.32 + uZenith * 0.07, near = uHorizon * 0.10 + uZenith * 0.035;
+        float t = (-190.0 - ro.z) / rd.z;
+        vec2 p = (ro + rd * t).xy;
+        float d = min(roofs(p), min(minaret(p - vec2(-30.0, 0.0)), mosque(p - vec2(-8.0, 0.0))));
+        col = mix(col, far, cover(d, 0.036 * (t / 6.0 - 1.0)));
+        t = (-24.0 - ro.z) / rd.z; p = (ro + rd * t).xy;
+        col = mix(col, near, cover(palm(p, vec2(3.4, 0.0), 11.5, -0.9, 3.0), 0.04 * (t / 6.0 - 1.0)));
+        t = (-16.0 - ro.z) / rd.z; p = (ro + rd * t).xy;
+        col = mix(col, near * 0.8, cover(palm(p, vec2(-5.6, 0.0), 8.6, 1.1, 11.0), 0.04 * (t / 6.0 - 1.0)));
+      }
+      gl_FragColor = vec4(col * uSkyShow, 1.0);
     }`,
 });
 const sky = new THREE.Mesh(new THREE.SphereGeometry(60, 32, 16), skyMat);
@@ -901,8 +980,12 @@ function applyDay(t) {
   bounceLight.intensity = I * bk * PI / 0.35 * HDR;
 
   compMat.uniforms.uFogCol.value.set(sun[0], sun[1], sun[2]).multiplyScalar(0.55);
-  compMat.uniforms.uExposure.value = lerp(1.6, 1.0, smooth(0.05, 0.6, e)) * lerp(1.8, 1, up);
-  brightMat.uniforms.uThresh.value = 1.4 / compMat.uniforms.uExposure.value;
+  const exposure = lerp(1.6, 1.0, smooth(0.05, 0.6, e)) * lerp(1.8, 1, up);
+  compMat.uniforms.uExposure.value = exposure;
+  brightMat.uniforms.uThresh.value = 1.4 / exposure;
+  // the view is shown dimmer than it really is, so it reads through the gaps instead of burning white
+  U.uSkyShow.value = 0.5 / Math.pow(exposure, 1.3);
+  U.uNight.value = smooth(0.02, -0.1, el);
 }
 
 /* ---------- Input: cursor, drag, tilt ---------- */
@@ -1040,7 +1123,7 @@ function tick(now) {
   }
   requestAnimationFrame(tick);
 }
-window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer } };
+window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer, get screen() { return screen; }, pane } };
 requestAnimationFrame(tick);
 })();
 </script>
