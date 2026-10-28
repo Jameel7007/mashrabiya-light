@@ -75,6 +75,7 @@ body { margin: 0; overflow: hidden; background: var(--bg); color: var(--ink); fo
 .tool svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .tool:hover { background: rgba(251, 241, 226, .1); }
 .tool:focus-visible { outline: 2px solid var(--glow); outline-offset: 1px; }
+.pick[aria-pressed="true"] { color: var(--glow); background: rgba(242, 194, 122, .16); }
 #sound .wave { display: none; }
 #sound[aria-pressed="true"] .wave { display: inline; }
 #sound[aria-pressed="true"] .mute { display: none; }
@@ -130,15 +131,13 @@ const WALL_T = 0.45;                                   // wall thickness, openin
 const LAT = { zc: -0.12, d: 0.06, bar: 0.052 };        // lattice plane, depth and bar width
 const DADO = 0.9;                                      // height of the tiled dado band
 
-/* ---------- 8-fold star lattice (Hankin, polygons in contact on 4.8.8) ---------- */
-const CELL = WIN.w / 4;                     // four octagons across
-const THETA = 67.5 * Math.PI / 180;         // contact angle giving {8/3} stars
+/* ---------- Star lattices by Hankin's method: polygons in contact, two rays from each edge's middle ---------- */
 function intersect(p, d, q, e) {
   const den = d[0] * e[1] - d[1] * e[0];
   const t = ((q[0] - p[0]) * e[1] - (q[1] - p[1]) * e[0]) / den;
   return [p[0] + d[0] * t, p[1] + d[1] * t];
 }
-function hankin(poly) {
+function hankin(poly, theta) {   // theta: the contact angle between each ray and its edge
   const n = poly.length, mids = [], tans = [], segs = [], pts = [];
   for (let k = 0; k < n; k++) {
     const a = poly[k], b = poly[(k + 1) % n];
@@ -146,7 +145,7 @@ function hankin(poly) {
     const dx = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dx, dy);
     tans.push([dx / l, dy / l]);
   }
-  const c = Math.cos(THETA), s = Math.sin(THETA);
+  const c = Math.cos(theta), s = Math.sin(theta);
   for (let k = 0; k < n; k++) {
     const k1 = (k + 1) % n, t0 = tans[k], t1 = tans[k1];
     const d0 = [c * t0[0] - s * t0[1], c * t0[1] + s * t0[0]];
@@ -171,6 +170,8 @@ function starOutline(h, c, scale) {
 }
 const about = (p, c, s) => [c[0] + (p[0] - c[0]) * s, c[1] + (p[1] - c[1]) * s];
 const ring = poly => poly.map((p, i) => [p, poly[(i + 1) % poly.length]]);
+const inWin = (p, m) => p[0] > WIN.x0 - m && p[0] < WIN.x0 + WIN.w + m && p[1] > WIN.y0 - m && p[1] < WIN.y0 + WIN.h + m;
+const CY = WIN.y0 + WIN.h / 2;   // the screen's centre line
 
 /* ---------- Jewel glass (qamariya), as light transmission colours (linear) ---------- */
 // Deep on purpose: the weak channels must sit near zero for the colour to survive tone mapping.
@@ -181,9 +182,23 @@ const JEWEL = {
   amber:     [1.000, 0.380, 0.012],
   turquoise: [0.006, 0.460, 0.440],
 };
-// Rosettes that carry glass, keyed "column,row". Petals alternate two colours, a heart turns the
-// solid centre star into a small glass one, a ring glazes the openings around the rosette.
-// Mirror-symmetric, and most openings stay clear so the white light still reads.
+
+/* ---------- The four lattices ---------- */
+// A pattern is wood in the screen's plane (metres): bars at full width, spokes at half width, frames
+// (thin outlines that hold a glass heart), solids (filled shapes) and discs (turned beads), plus the
+// rosette centres ("motifs") that the glass plans refer to. Glass plans name rosettes by grid
+// position: petals alternate two colours, a heart turns the solid centre star into a small glass
+// one, a ring glazes the openings around the rosette. Every plan is mirror-symmetric and leaves
+// most openings clear, so the white light still reads.
+const lattice = () => ({ bars: [], spokes: [], solids: [], frames: [], discs: [], motifs: [], glassFor: rosetteGlass });
+function rosette(out, h, c, r, n, plan = {}, ros = 0.36) {
+  const heart = starOutline(h, c, ros);
+  (plan.heart ? out.frames : out.solids).push(heart);
+  for (const m of h.mids) out.spokes.push([about(m, c, ros), m]);
+  out.motifs.push({ c, r, n, a0: Math.atan2(h.mids[0][1] - c[1], h.mids[0][0] - c[0]), plan });
+}
+
+// Eight-pointed {8/3} stars: octagons and squares in contact (4.8.8) at 67.5 degrees.
 const GLASS8 = {
   "-1,0":  { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
   "0,0":   { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
@@ -196,35 +211,149 @@ const GLASS8 = {
   "-1,-2": { heart: "turquoise" },
   "0,-2":  { heart: "turquoise" },
 };
-
-const pattern = (() => {
+function pattern8() {
+  const out = lattice(), CELL = WIN.w / 4, theta = 67.5 * Math.PI / 180;   // four octagons across
   const r = CELL / 2, R8 = r / Math.cos(Math.PI / 8), rs = r * Math.tan(Math.PI / 8);
-  const cy = WIN.y0 + WIN.h / 2;
-  const bars = [], spokes = [], solids = [], frames = [], motifs = [];
-  const inside = (p, m) => p[0] > WIN.x0 - m && p[0] < WIN.x0 + WIN.w + m && p[1] > WIN.y0 - m && p[1] < WIN.y0 + WIN.h + m;
   for (let i = -2; i <= 1; i++) for (let k = -4; k <= 4; k++) {
-    const c = [(i + 0.5) * CELL, cy + k * CELL];
-    if (!inside(c, CELL * 0.6)) continue;
-    const h = hankin(regular(c[0], c[1], 8, R8, Math.PI / 8));
-    bars.push(...h.segs);
-    const ros = 0.36, plan = GLASS8[i + "," + k] || {};
-    const heart = starOutline(h, c, ros);
-    (plan.heart ? frames : solids).push(heart);
-    for (const m of h.mids) spokes.push([about(m, c, ros), m]);
-    motifs.push({ c, r, n: 8, a0: Math.atan2(h.mids[0][1] - c[1], h.mids[0][0] - c[0]), plan });
+    const c = [(i + 0.5) * CELL, CY + k * CELL];
+    if (!inWin(c, CELL * 0.6)) continue;
+    const h = hankin(regular(c[0], c[1], 8, R8, Math.PI / 8), theta);
+    out.bars.push(...h.segs);
+    rosette(out, h, c, r, 8, GLASS8[i + "," + k]);
   }
   for (let i = -2; i <= 2; i++) for (let k = -4; k <= 4; k++) {
-    const c = [i * CELL, cy + (k + 0.5) * CELL];
-    if (!inside(c, CELL * 0.5)) continue;
-    const h = hankin(regular(c[0], c[1], 4, rs * Math.SQRT2, 0));
-    bars.push(...h.segs);
-    solids.push(starOutline(h, c, 1));
+    const c = [i * CELL, CY + (k + 0.5) * CELL];
+    if (!inWin(c, CELL * 0.5)) continue;
+    const h = hankin(regular(c[0], c[1], 4, rs * Math.SQRT2, 0), theta);
+    out.bars.push(...h.segs);
+    out.solids.push(starOutline(h, c, 1));
   }
-  return { bars, spokes, solids, frames, motifs };
-})();
+  return out;
+}
+
+// Six-pointed stars: hexagons in contact at 60 degrees, a hexagram in each and small hexagons between.
+// Odd columns sit half a row higher.
+const GLASS6 = {
+  "0,0":   { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
+  "-1,0":  { petals: ["turquoise", "lapis"] },
+  "1,0":   { petals: ["turquoise", "lapis"] },
+  "-1,-1": { petals: ["emerald", "amber"] },
+  "1,-1":  { petals: ["emerald", "amber"] },
+  "0,2":   { heart: "ruby" },
+  "-2,1":  { heart: "ruby" },
+  "2,1":   { heart: "ruby" },
+  "0,-2":  { heart: "turquoise" },
+  "-2,-2": { heart: "turquoise" },
+  "2,-2":  { heart: "turquoise" },
+};
+function pattern6() {
+  const out = lattice(), R = 0.36, dx = 1.5 * R, dy = Math.sqrt(3) * R;
+  for (let i = -3; i <= 3; i++) for (let k = -4; k <= 4; k++) {
+    const c = [i * dx, CY + k * dy + (i & 1 ? dy / 2 : 0)];
+    if (!inWin(c, R)) continue;
+    const h = hankin(regular(c[0], c[1], 6, R, 0), Math.PI / 3);
+    out.bars.push(...h.segs);
+    rosette(out, h, c, R * Math.sqrt(3) / 2, 6, GLASS6[i + "," + k]);
+  }
+  return out;
+}
+
+// Twelve-pointed rosettes: dodecagons, hexagons and squares in contact (4.6.12) at 60 degrees.
+// Dodecagons sit on a triangular grid, a square between each neighbouring pair, a hexagon in each
+// triangle of three.
+const GLASS12 = {
+  "0,0":  { petals: ["ruby", "amber"], heart: "amber", ring: "lapis" },
+  "-1,1": { heart: "ruby" },
+  "0,1":  { heart: "ruby" },
+  "0,-1": { heart: "emerald" },
+  "1,-1": { heart: "emerald" },
+};
+function pattern12() {
+  const out = lattice(), a = 0.21, D = (3 + Math.sqrt(3)) * a, theta = Math.PI / 3;
+  const R12 = a / (2 * Math.sin(Math.PI / 12)), r12 = a / (2 * Math.tan(Math.PI / 12));
+  const at = (i, j) => [(i + j / 2) * D, CY + j * D * Math.sqrt(3) / 2];
+  for (let j = -3; j <= 3; j++) for (let i = -4; i <= 4; i++) {
+    const c = at(i, j);
+    if (inWin(c, R12)) {
+      const h = hankin(regular(c[0], c[1], 12, R12, Math.PI / 12), theta);
+      out.bars.push(...h.segs);
+      rosette(out, h, c, r12, 12, GLASS12[i + "," + j]);
+    }
+    for (const [di, dj] of [[1, 0], [0, 1], [-1, 1]]) {   // squares toward three of the six neighbours
+      const d = at(i + di, j + dj), m = [(c[0] + d[0]) / 2, (c[1] + d[1]) / 2];
+      if (!inWin(m, a)) continue;
+      const h = hankin(regular(m[0], m[1], 4, a / Math.SQRT2, Math.atan2(d[1] - c[1], d[0] - c[0]) + Math.PI / 4), theta);
+      out.bars.push(...h.segs);
+      out.solids.push(starOutline(h, m, 1));
+    }
+    for (const [p, q] of [[[1, 0], [0, 1]], [[0, 1], [-1, 1]]]) {   // hexagons, one per triangle
+      const b = at(i + p[0], j + p[1]), d = at(i + q[0], j + q[1]);
+      const g = [(c[0] + b[0] + d[0]) / 3, (c[1] + b[1] + d[1]) / 3];
+      if (!inWin(g, a)) continue;
+      const h = hankin(regular(g[0], g[1], 6, a, 0), theta);
+      out.bars.push(...h.segs);
+      // the six hexagrams around the central rosette are glazed turquoise
+      out.motifs.push({ c: g, r: a * Math.sqrt(3) / 2, n: 6, a0: 0, plan: Math.hypot(g[0], g[1] - CY) < 0.7 ? { heart: "turquoise" } : {} });
+    }
+  }
+  return out;
+}
+
+// Turned wood, the classic Cairene mashrabiya: a diagonal grid of round spindles with a ball where
+// they cross and a bead between, and a small jewelled diamond of glass at its heart.
+const TURN = 0.105;   // spindle spacing
+function patternTurned() {
+  const out = lattice(), q = Math.SQRT1_2, reach = 22;
+  Object.assign(out, { round: true, barW: 0.018, depth: 0.03, glassFor: turnedGlass });
+  for (let k = -reach; k <= reach; k++) {
+    for (const [dx, dy] of [[q, q], [q, -q]]) {
+      const p = [-dy * k * TURN, CY + dx * k * TURN];
+      out.bars.push([[p[0] - dx * 4, p[1] - dy * 4], [p[0] + dx * 4, p[1] + dy * 4]]);
+    }
+  }
+  for (let i = -reach; i <= reach; i++) for (let j = -reach; j <= reach; j++) {
+    for (const [bi, bj, r] of [[0, 0, 0.024], [0.5, 0, 0.017], [0, 0.5, 0.017]]) {
+      const p = [(i + bi - j - bj) * TURN * q, CY + (i + bi + j + bj) * TURN * q];
+      if (inWin(p, 0.03)) out.discs.push([p[0], p[1], r]);
+    }
+  }
+  return out;
+}
+// rings of openings around the centre, counted along the grid
+function turnedGlass(pat, x, y) {
+  const q = Math.SQRT1_2, u = (x + y - CY) * q / TURN, v = (y - CY - x) * q / TURN;
+  return ["ruby", "amber", "lapis"][Math.floor(Math.max(Math.abs(u), Math.abs(v)))] || null;
+}
+
+// Icons: each pattern's own star outline drawn small, and the turned screen as a beaded grid.
+function starIcon(n, inner) {
+  let d = "";
+  for (let k = 0; k < 2 * n; k++) {
+    const a = -Math.PI / 2 + k * Math.PI / n, r = k % 2 ? 9 * inner : 9;
+    d += (k ? "L" : "M") + (12 + r * Math.cos(a)).toFixed(2) + " " + (12 + r * Math.sin(a)).toFixed(2);
+  }
+  return `<path d="${d}Z"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/>`;
+}
+function turnedIcon() {
+  let d = "", dots = "";
+  for (let k = -1; k <= 1; k++) {
+    d += `M${12 + (-1 - k) * 3.5} ${12 + (k - 1) * 3.5}l7 7`;   // spindles one way
+    d += `M${12 + (k + 1) * 3.5} ${12 + (k - 1) * 3.5}l-7 7`;   // and the other
+  }
+  for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) {
+    dots += `<circle cx="${12 + (i - j) * 3.5}" cy="${12 + (i + j) * 3.5}" r="1.5" fill="currentColor" stroke="none"/>`;
+  }
+  return `<path d="${d}"/>${dots}`;
+}
+const PATTERNS = [
+  { name: "Eight-pointed stars", build: pattern8, icon: starIcon(8, 0.54) },
+  { name: "Six-pointed stars", build: pattern6, icon: starIcon(6, 0.58) },
+  { name: "Twelve-pointed rosettes", build: pattern12, icon: starIcon(12, 0.7) },
+  { name: "Turned wood", build: patternTurned, icon: turnedIcon() },
+];
 
 // Choose the glass for one opening (by its centre) from the rosette plans around it.
-function glassFor(pat, x, y) {
+function rosetteGlass(pat, x, y) {
   let near = null, nd = 1e9;
   for (const m of pat.motifs) { const d = Math.hypot(x - m.c[0], y - m.c[1]) / m.r; if (d < nd) { nd = d; near = m; } }
   if (!near) return null;
@@ -259,10 +388,11 @@ function drawWood(g, pat, px, grow = 0) {
   const X = x => (x - WIN.x0) * px, Y = y => (WIN.y0 + WIN.h - y) * px;
   const path = poly => { g.beginPath(); poly.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1]))); g.closePath(); };
   g.strokeStyle = "#000"; g.fillStyle = "#000"; g.lineCap = "square"; g.lineJoin = "miter";
-  g.lineWidth = LAT.bar * px + grow;
+  g.lineWidth = (pat.barW || LAT.bar) * px + grow;
   g.beginPath();
   for (const [a, b] of pat.bars) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
   g.stroke();
+  for (const [x, y, r] of pat.discs) { g.beginPath(); g.arc(X(x), Y(y), r * px + grow / 2, 0, 2 * Math.PI); g.fill(); }
   g.lineWidth = LAT.bar * 0.5 * px + grow; g.lineCap = grow ? "square" : "butt";
   g.beginPath();
   for (const [a, b] of pat.spokes) { g.moveTo(X(a[0]), Y(a[1])); g.lineTo(X(b[0]), Y(b[1])); }
@@ -299,7 +429,7 @@ function glassLayer(pat) {
       if (y < LBL_H - 1 && open(p + LBL_W)) { lab[p + LBL_W] = id; stack.push(p + LBL_W); }
     }
     const m = LBL_W / WIN.w, cx = WIN.x0 + (sx / n + 0.5) / m, cy = WIN.y0 + WIN.h - (sy / n + 0.5) / m;
-    const name = glassFor(pat, cx, cy);
+    const name = pat.glassFor(pat, cx, cy);
     // each piece is cut from a slightly different sheet
     const shade = 0.82 + 0.28 * ((Math.sin(cx * 91.7 + cy * 47.3) * 43758.5453) % 1 + 1) % 1;
     tints.push(name ? JEWEL[name].map(v => v * shade) : null);
@@ -358,6 +488,14 @@ const RT_TYPE = floatOK ? THREE.HalfFloatType : THREE.UnsignedByteType;
 const isTouch = matchMedia("(pointer: coarse)").matches;
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// the lattice in use: ?p=0..3, else the visitor's last choice, else the eight-pointed stars
+let patIndex = (() => {
+  const ok = v => v >= 0 && v < PATTERNS.length;
+  if (ok(parseInt(qs.get("p"), 10))) return parseInt(qs.get("p"), 10);
+  try { const s = parseInt(localStorage.getItem("mashrabiya-pattern"), 10); if (ok(s)) return s; } catch (e) {}
+  return 0;
+})();
+let pattern = PATTERNS[patIndex].build();
 drawMask(pattern);
 
 /* noise volume for drifting dust density */
@@ -382,7 +520,7 @@ const noiseTex = (() => {
 const U = {
   uL: { value: new THREE.Vector3(0, 0.5, -0.8).normalize() },
   uWin: { value: new THREE.Vector4(WIN.x0, WIN.y0, WIN.w, WIN.h) },
-  uZ: { value: new THREE.Vector4(-WALL_T, LAT.zc + LAT.d / 2, LAT.zc - LAT.d / 2, 0) },
+  uZ: { value: new THREE.Vector4(-WALL_T, LAT.zc + (pattern.depth || LAT.d) / 2, LAT.zc - (pattern.depth || LAT.d) / 2, 0) },
   uMask: { value: maskTex },
   uTexel: { value: WIN.w / MASK_W },
   uSunCol: { value: new THREE.Vector3(1, 1, 1) },
@@ -550,9 +688,11 @@ function plane(w, h, pos, rotX, rotY) {
 /* ---------- The carved screen ---------- */
 const woodMat = new THREE.MeshStandardMaterial({ color: new THREE.Color().setRGB(0.13, 0.07, 0.036), roughness: 0.6, metalness: 0 });
 const BOX = new THREE.BoxGeometry(1, 1, 1);
+const ROD = new THREE.CylinderGeometry(0.5, 0.5, 1, 8, 1);   // turned spindles
+const BEAD = new THREE.SphereGeometry(1, 8, 6);
 function buildScreen(pat) {
   const group = new THREE.Group();
-  const all = [];
+  const all = [], rods = [];
   const clip = (a, b) => {   // Liang-Barsky against the opening, lightly expanded
     const m = 0.03, xmin = WIN.x0 - m, xmax = WIN.x0 + WIN.w + m, ymin = WIN.y0 - m, ymax = WIN.y0 + WIN.h + m;
     let t0 = 0, t1 = 1; const dx = b[0] - a[0], dy = b[1] - a[1];
@@ -563,7 +703,7 @@ function buildScreen(pat) {
     }
     return [[a[0] + dx * t0, a[1] + dy * t0], [a[0] + dx * t1, a[1] + dy * t1]];
   };
-  for (const s of pat.bars) { const c = clip(s[0], s[1]); if (c) all.push([c[0], c[1], LAT.bar, true]); }
+  for (const s of pat.bars) { const c = clip(s[0], s[1]); if (c) (pat.round ? rods : all).push([c[0], c[1], pat.barW || LAT.bar, true]); }
   for (const s of pat.spokes) all.push([s[0], s[1], LAT.bar * 0.5, false]);
   for (const poly of pat.frames) for (const [a, b] of ring(poly)) all.push([a, b, LAT.bar * 0.5, true]);
   const fw = 0.09, x1 = WIN.x0 + WIN.w, y1 = WIN.y0 + WIN.h;
@@ -591,6 +731,22 @@ function buildScreen(pat) {
   inst.count = n;
   inst.instanceMatrix.needsUpdate = true;
   group.add(inst);
+  if (rods.length) {   // a cylinder's axis is y, so turn it a quarter less than the bar's angle
+    const mesh = new THREE.InstancedMesh(ROD, woodMat, rods.length);
+    rods.forEach(([a, b, w], i) => {
+      T.set((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, LAT.zc);
+      Q.setFromAxisAngle(Z, Math.atan2(b[1] - a[1], b[0] - a[0]) - Math.PI / 2);
+      S.set(w, Math.hypot(b[0] - a[0], b[1] - a[1]), w);
+      mesh.setMatrixAt(i, M.compose(T, Q, S));
+    });
+    group.add(mesh);
+  }
+  if (pat.discs.length) {
+    const mesh = new THREE.InstancedMesh(BEAD, woodMat, pat.discs.length);
+    Q.identity();
+    pat.discs.forEach(([x, y, r], i) => mesh.setMatrixAt(i, M.compose(T.set(x, y, LAT.zc), Q, S.set(r, r, r))));
+    group.add(mesh);
+  }
   if (pat.solids.length) {
     const shapes = pat.solids.map(pts => new THREE.Shape(pts.map(p => new THREE.Vector2(p[0], p[1]))));
     const solid = new THREE.Mesh(new THREE.ExtrudeGeometry(shapes, { depth: LAT.d, bevelEnabled: false, curveSegments: 1 }), woodMat);
@@ -601,6 +757,17 @@ function buildScreen(pat) {
 }
 let screen = buildScreen(pattern);
 scene.add(screen);
+// swap the lattice: new pattern, new light mask, new wood (the shared shapes and materials stay)
+function usePattern(i) {
+  pattern = PATTERNS[i].build();
+  const depth = pattern.depth || LAT.d;
+  U.uZ.value.y = LAT.zc + depth / 2; U.uZ.value.z = LAT.zc - depth / 2;
+  drawMask(pattern);
+  scene.remove(screen);
+  screen.traverse(o => { if (o.isInstancedMesh) o.dispose(); else if (o.isMesh) o.geometry.dispose(); });
+  screen = buildScreen(pattern);
+  scene.add(screen);
+}
 
 /* ---------- Glass panes: one sheet inside the screen that shows only where the mask is tinted ---------- */
 const paneMat = new THREE.ShaderMaterial({
@@ -1301,6 +1468,36 @@ postMessage(d, [d.fountain[0].buffer, d.fountain[1].buffer, d.crickets[0].buffer
   };
 })();
 
+/* ---------- Pattern picker: four icon buttons beside the sound button ---------- */
+// Choosing one dims the light for a moment, swaps the lattice in the dark, and brings the light back.
+const toolsEl = document.getElementById("tools");
+const picks = PATTERNS.map((p, i) => {
+  const b = document.createElement("button");
+  b.className = "tool pick"; b.type = "button";
+  b.setAttribute("aria-label", p.name);
+  b.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${p.icon}</svg>`;
+  b.addEventListener("click", () => choosePattern(i));
+  toolsEl.insertBefore(b, document.getElementById("sound"));
+  return b;
+});
+{
+  const sep = document.createElement("span");
+  sep.className = "sep"; sep.setAttribute("aria-hidden", "true");
+  toolsEl.insertBefore(sep, document.getElementById("sound"));
+}
+const markPick = () => picks.forEach((b, i) => b.setAttribute("aria-pressed", String(i === patIndex)));
+markPick();
+let swapT = -1, swapTo = -1;
+const SWAP_DOWN = 0.35, SWAP_UP = 0.65;
+function choosePattern(i) {
+  if (i === patIndex) return;
+  patIndex = i; markPick();
+  try { localStorage.setItem("mashrabiya-pattern", String(i)); } catch (e) {}
+  if (reduceMotion) { usePattern(i); return; }
+  swapTo = i;
+  if (swapT < 0 || swapT >= SWAP_DOWN) swapT = swapT < 0 ? 0 : SWAP_DOWN - 0.01;
+}
+
 /* ---------- Frame loop ---------- */
 let last = performance.now(), time = 0, frame = 0, fade = 0, lifted = false;
 let perfAcc = 0, perfN = 0, perfChecks = 0;
@@ -1357,9 +1554,16 @@ function tick(now) {
   blurMat.uniforms.tSrc.value = b2b.texture; blurMat.uniforms.uDir.value.set(0, 1.5 / b2b.height); pass(blurMat, b2a);
 
   fade = Math.min(1, fade + dt / (reduceMotion ? 0.3 : 2.2));
+  let dim = 1;   // a pattern swap: dim, swap in the dark, brighten
+  if (swapT >= 0) {
+    swapT += dt;
+    if (swapTo >= 0 && swapT >= SWAP_DOWN) { usePattern(swapTo); swapTo = -1; }
+    dim = swapT < SWAP_DOWN ? 1 - 0.85 * smooth(0, SWAP_DOWN, swapT) : 0.15 + 0.85 * smooth(SWAP_DOWN, SWAP_DOWN + SWAP_UP, swapT);
+    if (swapT >= SWAP_DOWN + SWAP_UP) swapT = -1;
+  }
   const cu = compMat.uniforms;
   cu.tScene.value = sceneRT.texture; cu.tFog.value = fogRT.texture; cu.tB1.value = b1a.texture; cu.tB2.value = b2a.texture;
-  cu.uFade.value = fade * fade * (3 - 2 * fade);
+  cu.uFade.value = fade * fade * (3 - 2 * fade) * dim;
   pass(compMat, null);
 
   if (!lifted && frame > 2) { lifted = true; veil.classList.add("lifted"); }
@@ -1378,7 +1582,7 @@ function tick(now) {
   }
   requestAnimationFrame(tick);
 }
-window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { pattern, glassFor, glassLayer, get screen() { return screen; }, pane, sound } };
+window.__mash = { set t(v) { tCur = tTarget = v; introLeft = 0; }, get t() { return tCur; }, debug: { get pattern() { return pattern; }, glassLayer, get screen() { return screen; }, pane, sound } };
 requestAnimationFrame(tick);
 })();
 </script>
