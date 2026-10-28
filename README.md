@@ -5,7 +5,8 @@ through a few panes of jewel-coloured glass, and lays star-shaped light, white a
 the floor and walls. Move the sun from a rose dawn through white noon and a deep orange sunset into
 the blue hour.
 
-One HTML file, no build step. [three.js](https://threejs.org) r160 is loaded from jsDelivr.
+One HTML file and one short sound recording, no build step. [three.js](https://threejs.org) r160
+is loaded from jsDelivr.
 
 ## Using it
 
@@ -55,10 +56,12 @@ floor.
 path. The view is shown dimmer than its real brightness so it reads through the gaps instead of
 burning white.
 
-**Sound.** Everything is synthesised with the Web Audio API. A fountain loop (a soft wash of water
-and hundreds of tiny rising "bubble" chirps) and a cricket loop are rendered in a background
-worker; birds are scheduled live and follow the time of day: a dawn chorus, a drowsy noon with a
-laughing dove, crickets in the blue hour.
+**Sound.** A real field recording of a courtyard garden fountain with birds (see Credits). A
+52-second stretch with no passers-by was cut from it, lifted a little in level and saved as a
+0.5 MB MP3. The page fetches it on the first tap, decodes it with the Web Audio API and loops it:
+each pass starts three seconds before the last one ends and the two cross with equal-power fades,
+so the loudness holds steady and the join is never heard. After sunset a gentle low-pass filter
+softens the sound as the birds fall quiet.
 
 **Performance.** Phones render at 1.35× their CSS pixels (not their full 3×) with fewer beam
 steps; large desktop windows are held to about four million pixels. If the frame rate stays below
@@ -81,3 +84,10 @@ then open http://localhost:8000. Optional URL parameters for testing:
 | `?p=2` | open with a pattern: 0 eight-pointed, 1 six-pointed, 2 twelve-pointed, 3 turned wood |
 | `?q=1` | force a render scale and turn off automatic scaling |
 | `?ldr` | force the 8-bit path that phones without float textures use |
+
+## Credits
+
+- Fountain and birds: [fountain_ambience_2_courtyard_abbey_gardens_stereo.wav](https://freesound.org/people/nickmaysoundmusic/sounds/460559/)
+  by nickmaysoundmusic on Freesound, recorded in the Abbey Gardens, Bury St Edmunds, and released
+  under [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) (public domain). Trimmed
+  and re-encoded for this page as `audio/courtyard.mp3`.
