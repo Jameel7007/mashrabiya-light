@@ -46,6 +46,11 @@ it crosses upright planes: palms at 16 and 24 metres, a minaret, dome and roofli
 The shapes are drawn with distance functions and softened by distance, like a lens focused on the
 screen, and they shift against the lattice as the camera drifts.
 
+**The floor.** Large slabs of polished cream marble with soft veins. Besides the sunlight, each
+floor pixel bounces its view ray off the stone, finds where it meets the screen and reads the light
+mask there, blurred with distance, so the glowing screen and its glass are mirrored softly in the
+floor.
+
 **The day.** Sun colour and the sky's overhead and horizon colours are keyframes along the sun's
 path. The view is shown dimmer than its real brightness so it reads through the gaps instead of
 burning white.
